@@ -1,0 +1,29 @@
+# WinLinuxBridge settings example - THIS FILE IS NOT USED AT RUNTIME.
+#
+# The real settings live in  %USERPROFILE%\.winlinuxbridge\bridge.conf
+# and are written by the GUI (win\start-gui.cmd) or by install-win.ps1.
+#
+# No secrets belong here. The agent token lives in the user environment
+# variable WL_AGENT_TOKEN and in %USERPROFILE%\.winlinuxbridge\agent.token;
+# an optionally remembered password is stored separately and DPAPI-encrypted.
+#
+# WL_LINUX_HOST      Linux server address (the Windows side dials out to it)
+# WL_LINUX_USER      Linux account (only ~ needed, no sudo)
+# WL_SSH_PORT        SSH port, default 22
+# WL_REMOTE_ROOT     the one delivery folder on Linux,
+#                    empty means /home/<user>/WinLinuxBridge
+# WL_LOCAL_ROOT      Windows mirror of that folder (same layout)
+# WL_AGENT_PORT      control agent on 127.0.0.1 (Windows)
+# WL_TUNNEL_PORT     port the reverse tunnel binds on 127.0.0.1 (Linux)
+# WL_SYNC_INTERVAL   seconds between shared-folder lane syncs
+# WL_PROGRAM_REFRESH seconds between script refreshes
+
+WL_LINUX_HOST=
+WL_LINUX_USER=
+WL_SSH_PORT=22
+WL_REMOTE_ROOT=
+WL_LOCAL_ROOT=
+WL_AGENT_PORT=8787
+WL_TUNNEL_PORT=18080
+WL_SYNC_INTERVAL=30
+WL_PROGRAM_REFRESH=900
