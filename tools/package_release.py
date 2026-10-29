@@ -14,6 +14,7 @@ Refuses to build when a shippable text file still contains host identity
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import os
 import re
@@ -33,7 +34,9 @@ EXCLUDE_FILES = {
     "agent.token", "credentials.dat", "bridge.conf", "bridge.env",
     "AGENTS.md", "SHA256SUMS.txt",
 }
-EXCLUDE_SUFFIXES = (".pyc", ".pyo", ".zip", ".log", ".tok")
+# Release archives must not nest; the runtime's own stdlib archive must survive.
+EXCLUDE_NAME_PATTERNS = ("WinLinuxBridge-*.zip",)
+EXCLUDE_SUFFIXES = (".pyc", ".pyo", ".log", ".tok")
 
 # Paths relative to the archive root that must be present.
 REQUIRED = [
@@ -43,6 +46,7 @@ REQUIRED = [
     "win/winbridge_supervisor.ps1", "win/winbridge_sync.ps1",
     "win/install-win.ps1", "win/start-win.cmd",
     "win/runtime/python.exe", "win/runtime/pythonw.exe",
+    "win/runtime/python313.zip",
     "win/runtime/_tkinter.pyd", "win/runtime/tcl/tcl8.6/init.tcl",
     "win/runtime/tcl/tk8.6/tk.tcl", "win/vendor/plink.exe",
     "win/vendor/LICENSE-Python.txt", "win/vendor/LICENCE-PuTTY.txt",
@@ -85,6 +89,8 @@ def iter_files(base: str):
             if name in EXCLUDE_FILES:
                 continue
             if name.endswith(EXCLUDE_SUFFIXES):
+                continue
+            if any(fnmatch.fnmatch(name, pattern) for pattern in EXCLUDE_NAME_PATTERNS):
                 continue
             absolute = os.path.join(dirpath, name)
             relative = os.path.relpath(absolute, base).replace(os.sep, "/")

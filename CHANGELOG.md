@@ -34,7 +34,7 @@ client timeout, a tunnel drop or an agent restart can no longer be confused with
 - **Structured execution**: `exe + argv[] + cwd + env`, keeping the string/PowerShell/cmd
   forms for compatibility.
 - **`tools/verify_jobs.sh`** (17 checks) and **`tools/verify_cancel.sh`** (6 checks).
-- **`tools/package-release.ps1`** — reproducible zero-install archive with a host-identity
+- **`tools/package_release.py`** — reproducible zero-install archive with a host-identity
   scan before packaging.
 - **`tools/normalize-lf.py`** — enforces LF on every script that runs on Linux.
 - Bilingual documentation (`README.md`, `README.zh-CN.md`) and `CHANGELOG.md`.
@@ -65,6 +65,10 @@ client timeout, a tunnel drop or an agent restart can no longer be confused with
   Windows (`killed` reported 0 while the process was already gone).
 - Restart left phantom `RUNNING` jobs; the agent now reclassifies orphaned jobs as `LOST`.
 - Large capture files grew unbounded; the 32 MB cap is now enforced while the job runs.
+- The packager excluded every `*.zip`, which silently dropped the runtime's own standard
+  library archive (`win/runtime/python313.zip`) and made the shipped interpreter abort with
+  `ModuleNotFoundError: No module named 'encodings'`. It now excludes only the release
+  archive itself, and the stdlib archive is a required entry checked at build time.
 
 ### Security
 
