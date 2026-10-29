@@ -281,3 +281,9 @@ credentials, host names or account names.
 
 [MIT](LICENSE). Bundled third-party components keep their own licences, shipped in
 `win/vendor/`.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\fetch-vendor.ps1        # plink + licences
+powershell -ExecutionPolicy Bypass -File tools\build-runtime.ps1       # portable Python + Tk
+python tools\package_release.py                                        # release archive
+```

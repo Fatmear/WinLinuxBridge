@@ -265,4 +265,10 @@ powershell -ExecutionPolicy Bypass -File tools\verify.ps1
 
 ## 许可
 
-[MIT](LICENSE)。随包第三方组件保留各自许可，原文见 `win/vendor/`。
+[MIT](LICENSE)。随包第三方组件保留各自许可，原文见 `win/vendor/`.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\fetch-vendor.ps1        # plink + 许可证
+powershell -ExecutionPolicy Bypass -File tools\build-runtime.ps1       # 便携 Python + Tk
+python tools\package_release.py                                        # 发布压缩包
+```
