@@ -185,10 +185,10 @@ created `~/WinLinuxBridge` and put `wl` on `PATH`; open a new shell and run `wl 
 
 ## Documentation
 
-- [`README.md`](README.md) — project overview (Chinese) · [`README.en.md`](README.en.md) — same in English
-- [`docs/USAGE.md`](docs/USAGE.md) — deployment, configuration, troubleshooting
-- [`docs/AI-AGENT.md`](docs/AI-AGENT.md) — operating manual for automation and AI agents
-- [`CHANGELOG.md`](CHANGELOG.md) — full history
+- [`README.md`](https://github.com/Fatmear/WinLinuxBridge/blob/v1.3.0/README.md) — project overview (Chinese) · [`README.en.md`](https://github.com/Fatmear/WinLinuxBridge/blob/v1.3.0/README.en.md) — same in English
+- [`docs/USAGE.md`](https://github.com/Fatmear/WinLinuxBridge/blob/v1.3.0/docs/USAGE.md) — deployment, configuration, troubleshooting
+- [`docs/AI-AGENT.md`](https://github.com/Fatmear/WinLinuxBridge/blob/v1.3.0/docs/AI-AGENT.md) — operating manual for automation and AI agents
+- [`CHANGELOG.md`](https://github.com/Fatmear/WinLinuxBridge/blob/v1.3.0/CHANGELOG.md) — full history
 
 ## Licence and third-party components
 
