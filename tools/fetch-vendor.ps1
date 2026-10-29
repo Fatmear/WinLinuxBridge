@@ -1,4 +1,4 @@
-# Obtains the vendored PuTTY plink binary and its licence texts.
+﻿# Obtains the vendored PuTTY plink binary and its licence texts.
 #
 # plink is only needed for the single password login that installs the public
 # keys. Shipping it keeps the release "double-click and go", but it is a binary,
