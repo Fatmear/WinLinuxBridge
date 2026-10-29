@@ -32,7 +32,7 @@ EXCLUDE_DIRS = {
 }
 EXCLUDE_FILES = {
     "agent.token", "credentials.dat", "bridge.conf", "bridge.env",
-    "AGENTS.md", "SHA256SUMS.txt",
+    "AGENTS.md", "SHA256SUMS.txt", "RELEASE_BODY.md",
 }
 # Release archives must not nest; the runtime's own stdlib archive must survive.
 EXCLUDE_NAME_PATTERNS = ("WinLinuxBridge-*.zip",)
@@ -40,7 +40,7 @@ EXCLUDE_SUFFIXES = (".pyc", ".pyo", ".log", ".tok")
 
 # Paths relative to the archive root that must be present.
 REQUIRED = [
-    "VERSION", "README.md", "README.zh-CN.md", "LICENSE", "CHANGELOG.md",
+    "VERSION", "README.md", "README.en.md", "LICENSE", "CHANGELOG.md",
     "win/start-gui.cmd", "win/WinBridgeGUI.pyw", "win/winbridge_agent.py",
     "win/winbridge_jobs.py", "win/winbridge_common.ps1",
     "win/winbridge_supervisor.ps1", "win/winbridge_sync.ps1",

@@ -185,7 +185,7 @@ created `~/WinLinuxBridge` and put `wl` on `PATH`; open a new shell and run `wl 
 
 ## Documentation
 
-- [`README.md`](README.md) / [`README.zh-CN.md`](README.zh-CN.md) — project overview
+- [`README.md`](README.md) — project overview (Chinese) · [`README.en.md`](README.en.md) — same in English
 - [`docs/USAGE.md`](docs/USAGE.md) — deployment, configuration, troubleshooting
 - [`docs/AI-AGENT.md`](docs/AI-AGENT.md) — operating manual for automation and AI agents
 - [`CHANGELOG.md`](CHANGELOG.md) — full history

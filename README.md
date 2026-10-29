@@ -2,250 +2,237 @@
 
 # WinLinuxBridge
 
-**Operate a Windows desktop from a Linux shell — over a tunnel Windows opens itself.**
+**在 Linux 终端里操作 Windows 桌面 —— 隧道由 Windows 自己发起。**
 
-Steer Windows applications, GUIs, files and local services from Linux automation with no
-inbound port, no port forwarding, no admin rights on either side, and no third-party relay.
+用 Linux 上的自动化脚本驱动 Windows 的应用程序、图形界面、文件与本机服务：
+不开入站端口、不做端口映射、两端都不要管理员权限、不依赖任何第三方中转。
 
-[中文](README.zh-CN.md) | **English**
+**中文** | [English](README.en.md)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20%7C%20Linux-lightgrey.svg)](#requirements)
-[![Python](https://img.shields.io/badge/python-3.13%20bundled-informational.svg)](#zero-install)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20%7C%20Linux-lightgrey.svg)](#环境要求)
+[![Python](https://img.shields.io/badge/python-3.13%20内置-informational.svg)](#开箱即用)
 [![Version](https://img.shields.io/badge/version-1.3.0-success.svg)](CHANGELOG.md)
 
 </div>
 
 ---
 
-## Why this exists
+## 为什么需要它
 
-Linux servers are the natural place to run automation and AI agents. The Windows machines
-that own the hardware — serial ports, flashing tools, vendor GUIs, internal web endpoints —
-are usually unreachable from that Linux host: no inbound port, no administrative rights, and
-a public relay is either forbidden or fragile.
+Linux 服务器是跑自动化和 AI 代理的天然位置。但那些真正握着硬件的 Windows 机器 —
+串口、烧录工具、厂商上位机、内网接口 — 通常从 Linux 根本够不着：没有入站端口、
+没有管理员权限，而端口映射或公网中转要么被禁止，要么一碰就断。
 
-WinLinuxBridge inverts the direction. **Windows dials out to Linux** over SSH and opens a
-reverse tunnel. Linux then talks to `127.0.0.1` and reaches a control agent running on
-Windows. Nothing listens on the network at either end, and nothing has to be installed
-system-wide.
+WinLinuxBridge 把方向反过来：**Windows 主动连 Linux**，用 SSH 建立反向隧道；
+Linux 只要访问本机 `127.0.0.1` 就能抵达跑在 Windows 上的控制代理。
+两端都没有对外监听，也不需要往系统里装任何东西。
 
 ```
-   Linux host                                         Windows desktop
-   ──────────                                         ───────────────
-   ~/WinLinuxBridge/  ────── one delivery folder ──────  %USERPROFILE%\WinLinuxBridge\
-   ├── win/            sources, GUI, agent
-   ├── linux/          wl CLI
-   ├── tools/          verification suites
-   ├── docs/           manuals
-   └── shared/         three sync lanes
+   Linux 主机                                         Windows 桌面
+   ──────────                                         ────────────
+   ~/WinLinuxBridge/  ────── 唯一交付目录 ──────  %USERPROFILE%\WinLinuxBridge\
+   ├── win/            源码、图形界面、代理
+   ├── linux/          wl 命令行
+   ├── tools/          验证套件
+   ├── docs/           手册
+   └── shared/         三条同步车道
 
-   wl run / wl job ──► 127.0.0.1:18080 ══ reverse SSH tunnel ══► 127.0.0.1:8787 agent
-                     (opened BY Windows)                         │
-                                          subprocess · Win32 · urllib
-                                                                 ▼
-                                                    programs · GUI · local HTTP
+   wl run / wl job ──► 127.0.0.1:18080 ══ 反向 SSH 隧道 ══► 127.0.0.1:8787 代理
+                      （由 Windows 发起）                    │
+                                        subprocess · Win32 · urllib
+                                                               ▼
+                                                  程序 · 图形界面 · 本机 HTTP
 ```
 
-## Features
+## 核心特性
 
-**Execution that survives real networks**
+**为真实网络设计的执行语义**
 
-- Every command becomes a durable **job** on Windows disk: state, pid, timestamps, exit code
-  and output files stay queryable across client timeouts, tunnel drops and agent restarts.
-- **Three timeouts, deliberately separate** — connect, execution, client wait. A client that
-  stops waiting reports *state unknown / still running*, never a fake failure.
-- **Retry safety** via `request_id`: repeating an identical request returns the original job
-  instead of flashing the board twice.
-- **Cancel is scoped**: only the targeted process tree is killed, and the cleanup is reported.
+- 每条命令都成为落在 Windows 磁盘上的**持久化任务**：状态、PID、时间戳、退出码、
+  输出文件在客户端超时、隧道断开、代理重启之后依然可查。
+- **三个超时严格分离**：连接、执行、客户端等待。客户端等不到时只报"状态未知/仍在运行"，
+  绝不谎报失败。
+- **重试安全**：`request_id` 相同则返回原任务，不会把板子烧两遍。
+- **取消有边界**：只杀目标任务自己的进程树，并回报清理结果。
 
-**Output that respects context windows**
+**尊重上下文窗口的输出策略**
 
-- Full output is streamed to disk (32 MB cap, enforced live) and returned as a bounded
-  summary with byte counts and SHA-256.
-- Byte-cursor streaming (`--since`) for incremental reads.
-- Extra fields from vendor tools are preserved verbatim — the bridge never rewrites results.
+- 完整输出流式落盘（32 MB 上限，运行中持续施加），对外只返回有界摘要 + 字节数 + SHA-256。
+- 支持按字节游标增量读取（`--since`）。
+- 厂商工具的多余字段原样保留 —— 桥接绝不改写工具结果。
 
-**Operating Windows**
+**操作 Windows 的能力**
 
-- Run programs with structured `exe + argv[] + cwd + env` (no shell quoting layers) or
-  through PowerShell / cmd.
-- Screenshots (PNG via GDI + stdlib zlib, no Pillow), mouse, keyboard, clipboard,
-  window listing/focus/close, and reverse-proxied HTTP to Windows-local services.
-- File read/write confined to the user profile, with an explicit allow-list.
+- 结构化执行 `exe + argv[] + cwd + env`（绕开所有 shell 引号层），也支持 PowerShell / cmd。
+- 截图（GDI + 标准库 zlib 生成 PNG，不依赖 Pillow）、鼠标、键盘、剪贴板、
+  窗口列举/置前/关闭，以及反向代理访问 Windows 本机 HTTP 服务。
+- 文件读写限定在用户目录白名单内，越界返回 `403`。
 
-**Zero install, zero privilege**
+**零安装、零提权**
 
-- Ships a portable CPython with working Tk, plus `plink` for the one-time password step.
-- No administrator rights on Windows; only the login user's `$HOME` on Linux.
-- One delivery folder; a double-click launcher plus a GUI for first-time setup.
+- 内置便携 CPython（含可用的 Tk）与一次性密码登录用的 `plink`。
+- Windows 不需要管理员权限；Linux 只用到登录用户的 `$HOME`。
+- 只有一个交付目录；双击启动 + 图形界面完成首次配置。
 
-## Requirements
+## 环境要求
 
-| Side | Needs |
+| 侧 | 需要 |
 | --- | --- |
-| Windows 10/11 | Built-in OpenSSH client (`ssh.exe`, `scp.exe`). No admin, no Python install. |
-| Linux | `bash`, `curl` or `python3`, an SSH account. No root, no system packages. |
-| Network | Windows can reach the Linux host on SSH. Linux needs **no** inbound path to Windows. |
+| Windows 10/11 | 系统自带 OpenSSH 客户端（`ssh.exe`、`scp.exe`）。不需要管理员，不需要装 Python。 |
+| Linux | `bash`、`curl` 或 `python3`、一个 SSH 账号。不需要 root，不装系统包。 |
+| 网络 | Windows 能 SSH 到 Linux。Linux **不需要**任何到 Windows 的入站通路。 |
 
-## Quick start
+## 快速开始
 
-**1. Windows — double-click `win\start-gui.cmd`**
+**1. Windows：双击 `win\start-gui.cmd`**
 
-Fill in the Linux address, account and password, then press **Install and start**
-(安装并启动). The first run shows the server host-key fingerprint for confirmation, then
-generates keys, installs the public keys, uploads the package, configures the token,
-registers autostart and launches the bridge.
+填写 Linux 地址、账号、密码，点「安装并启动」。首次会先显示服务器主机指纹让你确认，
+随后自动完成：生成密钥 → 装公钥 → 上传程序 → 配置令牌 → 注册自启 → 启动。
 
-The password is not stored by default. The optional "remember" box encrypts it with Windows
-DPAPI, bound to the current Windows account and machine.
+密码默认不落盘；勾选「记住密码」才保存，且用 Windows DPAPI 加密，绑定当前
+Windows 账户与本机。
 
-Command-line equivalent:
+命令行等价做法：
 
 ```powershell
-$env:WL_LINUX_PASSWORD = '<typed locally, never written to disk>'
+$env:WL_LINUX_PASSWORD = '<只在本地会话输入，不落盘>'
 powershell -ExecutionPolicy Bypass -File win\install-win.ps1 -NonInteractive
 ```
 
-**2. Linux — use it**
+**2. Linux：直接开始用**
 
 ```bash
-wl status                 # tunnel, agent and sync lanes at a glance
-wl run "ipconfig"         # run a command on Windows
-wl doctor                 # versions, shells, timeouts, paths, job stats
+wl status                 # 一屏看清隧道、代理、同步车道
+wl run "ipconfig"         # 在 Windows 上执行命令
+wl doctor                 # 版本、可用 shell、各层超时、路径、任务统计
 ```
 
-## CLI reference
+## 命令一览
 
-| Command | Purpose |
+| 命令 | 用途 |
 | --- | --- |
-| `wl status` / `wl ping` / `wl doctor` | health, identity, full environment report |
-| `wl run [opts] -- <cmd>` | run and wait; durable job underneath |
-| `wl job start\|status\|logs\|result\|cancel\|list` | full job control |
-| `wl batch --file plan.json` | multi-step plan with resource keys |
-| `wl ps` / `wl focus` / `wl shot` | window inventory, focus, screenshot |
-| `wl click` / `wl move` / `wl type` / `wl key` | mouse and keyboard |
-| `wl copy` / `wl paste` | clipboard |
-| `wl http <url>` | call a Windows-local HTTP service |
-| `wl ls` / `wl get` / `wl put` / `wl rm` | file transfer inside the profile |
-| `wl start <path\|url>` / `wl lanes` | open on Windows, inspect sync lanes |
+| `wl status` / `wl ping` / `wl doctor` | 健康检查、代理身份、完整环境报告 |
+| `wl run [选项] -- <命令>` | 执行并等待；底层是持久化任务 |
+| `wl job start\|status\|logs\|result\|cancel\|list` | 完整任务控制 |
+| `wl batch --file plan.json` | 多步计划 + 资源键互斥 |
+| `wl ps` / `wl focus` / `wl shot` | 窗口列举、置前、截图 |
+| `wl click` / `wl move` / `wl type` / `wl key` | 鼠标与键盘 |
+| `wl copy` / `wl paste` | 剪贴板 |
+| `wl http <url>` | 访问 Windows 本机 HTTP 服务 |
+| `wl ls` / `wl get` / `wl put` / `wl rm` | 用户目录内的文件传输 |
+| `wl start <路径\|URL>` / `wl lanes` | 在 Windows 打开、查看同步车道 |
 
-`wl run` options: `--shell`, `--timeout`, `--wait`, `--no-wait`, `--json`,
-`--output text|json|summary`, `--request-id`, `--resource`, `--cwd`, `--env`, `--exe`.
+`wl run` 选项：`--shell`、`--timeout`、`--wait`、`--no-wait`、`--json`、
+`--output text|json|summary`、`--request-id`、`--resource`、`--cwd`、`--env`、`--exe`。
 
-## The job model
+## 任务模型
 
 ```
-        start                run                  finish
-client ──► /job/start ──► QUEUED ──► RUNNING ──► SUCCEEDED | FAILED | TIMEOUT
-                            │             │                | CANCELLED | LOST
-                            │             └── cancel ──────┘
-                            └── resource key held by another job
+        启动                 运行                  结束
+客户端 ──► /job/start ──► QUEUED ──► RUNNING ──► SUCCEEDED | FAILED | TIMEOUT
+                            │            │                | CANCELLED | LOST
+                            │            └── cancel ──────┘
+                            └── 资源键被其它任务占用，排队
 ```
 
-**States** — `QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `TIMEOUT`, `CANCELLED`, `LOST`,
-`SPAWN_ERROR`.
+**状态**：`QUEUED`、`RUNNING`、`SUCCEEDED`、`FAILED`、`TIMEOUT`、`CANCELLED`、
+`LOST`、`SPAWN_ERROR`。
 
-**Error codes** — `PROCESS_EXIT_NONZERO`, `TIMEOUT_KILLED`, `CANCELLED_BY_REQUEST`,
-`SPAWN_FAILED`, `JOB_LOST`, `CLIENT_WAIT_TIMEOUT`, `RESOURCE_WAIT_TIMEOUT`,
-`BRIDGE_UNREACHABLE`.
+**错误码**：`PROCESS_EXIT_NONZERO`、`TIMEOUT_KILLED`、`CANCELLED_BY_REQUEST`、
+`SPAWN_FAILED`、`JOB_LOST`、`CLIENT_WAIT_TIMEOUT`、`RESOURCE_WAIT_TIMEOUT`、
+`BRIDGE_UNREACHABLE`。
 
-**Exit codes**
+**退出码**
 
-| Code | Meaning |
+| 码 | 含义 |
 | --- | --- |
-| `0` | job succeeded |
-| `1` | program ran and exited non-zero — a real test failure |
-| `124` | client wait expired; **state unknown, not a failure** |
-| `125` | bridge unreachable |
-| `126` | program could not be started |
-| `130` | job cancelled |
+| `0` | 任务成功 |
+| `1` | 程序跑完但返回非零 —— 真实的业务/测试失败 |
+| `124` | 客户端等待超时；**状态未知，不是失败** |
+| `125` | 桥接不可达 |
+| `126` | 程序无法启动 |
+| `130` | 任务被取消 |
 
-Always judge in this order: `transport_ok` → `state` → `error_code` → `exit_code`.
-**A successful bridge call says nothing about whether the program's own test passed.**
+判定顺序永远是：`transport_ok` → `state` → `error_code` → `exit_code`。
+**桥接调用成功，不代表程序自己的测试通过。**
 
-Jobs live in `%USERPROFILE%\.winlinuxbridge\jobs\<job_id>\`
-(`job.json`, `stdout.log`, `stderr.log`), retained 7 days by default
-(`WL_JOB_KEEP_DAYS`). On restart the agent reclassifies jobs whose processes died with it as
-`LOST`, so no client waits forever on a phantom `RUNNING`.
+任务落盘在 `%USERPROFILE%\.winlinuxbridge\jobs\<job_id>\`（`job.json`、`stdout.log`、
+`stderr.log`），默认保留 7 天（`WL_JOB_KEEP_DAYS`）。代理重启时会把随它一起死掉的
+`RUNNING` 标为 `LOST`，不会留下让客户端永远干等的假运行态。
 
-## Timeouts
+## 三个超时
 
-| Timeout | Enforced by | Default | Outcome |
+| 超时 | 由谁执行 | 默认值 | 结果 |
 | --- | --- | --- | --- |
-| Connect | Linux client (`WL_CONNECT_TIMEOUT`) | 5 s | exit 125, `BRIDGE_UNREACHABLE` |
-| Execution | Windows agent (`--timeout`) | 120 s | state `TIMEOUT`, tree killed, `TIMEOUT_KILLED` |
-| Client wait | Linux client (`--wait`) | execution + `WL_WAIT_MARGIN` (30 s) | exit 124, still running |
+| 连接 | Linux 客户端（`WL_CONNECT_TIMEOUT`） | 5 秒 | 退出码 125，`BRIDGE_UNREACHABLE` |
+| 执行 | Windows 代理（`--timeout`） | 120 秒 | 状态 `TIMEOUT`，杀进程树，`TIMEOUT_KILLED` |
+| 客户端等待 | Linux 客户端（`--wait`） | 执行超时 + `WL_WAIT_MARGIN`（30 秒） | 退出码 124，仍在运行 |
 
-## Shared folder
+## 共享目录
 
-One delivery folder, mirrored on both sides with identical layout. Three lanes keep
-conflicts impossible:
+一个交付目录，两端层级完全一致。三条车道让冲突不可能发生：
 
-| Lane | Writer | Reader | Sync |
+| 车道 | 写入方 | 读取方 | 同步方式 |
 | --- | --- | --- | --- |
-| `shared/from_win` | Windows | Linux | pushed every 30 s |
-| `shared/to_win` | Linux | Windows | pulled every 30 s |
-| `shared/shared` | both | both | pull → newest-wins merge → push |
+| `shared/from_win` | Windows | Linux | 每 30 秒推送 |
+| `shared/to_win` | Linux | Windows | 每 30 秒拉取 |
+| `shared/shared` | 两边 | 两边 | 拉取 → 较新者胜合并 → 推回 |
 
-Deletions are not propagated; use `wl rm` for that. Need it now rather than in 30 s?
-`wl put` / `wl get` transfer immediately over the same tunnel.
+**不传播删除**：要真删请用 `wl rm`。需要立刻生效而不等 30 秒？`wl put` / `wl get`
+走同一条隧道即时传输。
 
-## Security model
+## 安全模型
 
-- The agent binds `127.0.0.1` only and is reachable from Linux **solely** through the reverse
-  tunnel that Windows opens.
-- Every request carries `Authorization: Bearer <token>`. The token is generated during
-  install and stored in a user-scoped environment variable plus an ACL-restricted file on
-  Windows and a `0600` file on Linux.
-- Two dedicated keys. The tunnel key is `restrict,port-forwarding,permitlisten="127.0.0.1:18080"`
-  — leaking it opens one loopback port, not a shell. The sync key is `no-pty,no-port-forwarding`.
-- The Linux password is used once, to append public keys. It is read from a local session
-  environment variable or an interactive prompt, and is not written to any file or log.
-- File APIs are confined to an allow-list rooted at the bridge folder and `%USERPROFILE%`;
-  anything else returns `403`.
-- `wl doctor` reports versions, shells, limits and paths — never credentials.
+- 代理只监听 `127.0.0.1`，从 Linux 只能经 Windows 主动建立的反向隧道抵达。
+- 每个请求都带 `Authorization: Bearer <令牌>`。令牌在安装时生成，存于用户级环境变量与
+  Windows 上受 ACL 限制的文件，以及 Linux 上 `0600` 的文件。
+- 两把专用密钥。隧道密钥为
+  `restrict,port-forwarding,permitlisten="127.0.0.1:18080"` —— 即使泄露也只能顶开一个
+  回环端口，拿不到 shell。同步密钥为 `no-pty,no-port-forwarding`。
+- Linux 密码只用于一次性追加公钥，来自本地会话环境变量或交互输入，不写入任何文件与日志。
+- 文件接口限制在交付目录与 `%USERPROFILE%` 组成的白名单内，越界返回 `403`。
+- `wl doctor` 只报告版本、shell、限额与路径，绝不包含凭据。
 
-## Zero install
+## 开箱即用
 
-The release archive is self-contained:
+发布压缩包自带全部依赖：
 
-| Component | Version | Licence | Purpose |
+| 组件 | 版本 | 许可 | 用途 |
 | --- | --- | --- | --- |
-| CPython (embeddable) | 3.13 | PSF | portable interpreter |
-| Tcl/Tk | 8.6 | Tcl/Tk | the setup GUI |
-| PuTTY `plink` | 0.77 | MIT | one-time password login for key install |
+| CPython（embeddable） | 3.13 | PSF | 便携解释器 |
+| Tcl/Tk | 8.6 | Tcl/Tk | 配置界面 |
+| PuTTY `plink` | 0.77 | MIT | 装公钥时的一次性密码登录 |
 
-To rebuild the runtime from public sources:
+从公开源重新构建运行时：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\build-runtime.ps1
 ```
 
-The script downloads the official embeddable package and grafts Tcl/Tk plus `_tkinter.pyd`
-(which the embeddable build deliberately omits), then verifies that a real `Tk()` window can
-be created.
+脚本会下载官方 embeddable 包，并补上它**故意不含**的 Tcl/Tk 与 `_tkinter.pyd`，
+最后用真实的 `Tk()` 窗口做自检。
 
-## Building from source (this repository)
+## 从源码构建（本仓库）
 
-This repository holds **source only** — `win/runtime/` and `win/vendor/*.exe` are produced by
-the build scripts and shipped inside the release archive instead of being committed.
+本仓库只放**源码** —— `win/runtime/` 与 `win/vendor/*.exe` 由构建脚本产出，
+放在发布压缩包里，不进 git。
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools\build-runtime.ps1   # portable Python + Tk
-powershell -ExecutionPolicy Bypass -File tools\package-release.ps1  # build release zip
+powershell -ExecutionPolicy Bypass -File tools\build-runtime.ps1   # 便携 Python + Tk
+powershell -ExecutionPolicy Bypass -File tools\package-release.ps1  # 生成发布压缩包
 ```
 
-## Verification
+## 验证
 
-Every claim above is checked by scripts that run on the real tunnel.
+上文的每一条能力都由脚本在真实隧道上验证过。
 
-| Suite | Covers | Count |
+| 套件 | 覆盖内容 | 项数 |
 | --- | --- | --- |
-| `tools/verify.ps1` | static checks, agent endpoints, job engine, cancel isolation, output limits | 38 |
-| `tools/verify.sh` | Linux layout, permissions, tunnel, round trip | 20 |
-| `tools/verify_jobs.sh` | timeout semantics, dedupe, cursors, batch, doctor | 17 |
-| `tools/verify_cancel.sh` | cancel scope and bridge survival | 6 |
+| `tools/verify.ps1` | 静态检查、代理端点、任务引擎、取消隔离、输出限额 | 38 |
+| `tools/verify.sh` | Linux 布局、权限、隧道、往返执行 | 20 |
+| `tools/verify_jobs.sh` | 超时语义、去重、游标、批处理、doctor | 17 |
+| `tools/verify_cancel.sh` | 取消边界与桥接存活 | 6 |
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\verify.ps1
@@ -257,33 +244,31 @@ powershell -ExecutionPolicy Bypass -File tools\verify.ps1
 ~/WinLinuxBridge/tools/verify_cancel.sh
 ```
 
-## Known limitations
+## 已知限制
 
-- GUI control requires an unlocked Windows session; a locked session yields black screenshots.
-- Autostart triggers at logon, so after a reboot the bridge returns once someone logs in.
-- Sync is a periodic full rescan of small trees; large files should use `wl put` / `wl get`.
-- The tunnel binds loopback only, so other LAN hosts cannot borrow it (by design).
-- One Windows desktop per bridge instance; multiple targets use separate installs.
+- 图形界面操作要求 Windows 会话处于解锁状态；锁屏时截图会是黑的。
+- 自启在登录时触发，因此重启后需有人登录，桥接才会恢复。
+- 同步是周期性全量比对，只适合中小目录；大文件请用 `wl put` / `wl get`。
+- 隧道只绑回环，局域网内其它主机无法借用（这是设计意图）。
+- 一个桥接实例对应一台 Windows 桌面；多个目标请分别部署。
 
-## Documentation
+## 文档
 
-- [`docs/USAGE.md`](docs/USAGE.md) — deployment, configuration, troubleshooting
-- [`docs/AI-AGENT.md`](docs/AI-AGENT.md) — operating manual written for automation and AI agents
-- [`CHANGELOG.md`](CHANGELOG.md) — release history
+- [`docs/USAGE.md`](docs/USAGE.md) —— 部署、配置、排障
+- [`docs/AI-AGENT.md`](docs/AI-AGENT.md) —— 写给自动化与 AI 代理的操作手册
+- [`CHANGELOG.md`](CHANGELOG.md) —— 版本历史
 
-## Contributing
+## 参与贡献
 
-Issues and pull requests are welcome. Please run the four verification suites before opening
-a PR, keep shell scripts LF-only (`python tools/normalize-lf.py`), and never commit
-credentials, host names or account names.
+欢迎 Issue 与 PR。提交前请跑完四套验证，保持 shell 脚本为 LF
+（`python tools/normalize-lf.py`），并且**不要**提交凭据、主机名或账号名。
 
-## License
+## 许可
 
-[MIT](LICENSE). Bundled third-party components keep their own licences, shipped in
-`win/vendor/`.
+[MIT](LICENSE)。随包第三方组件保留各自许可，原文见 `win/vendor/`.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools\fetch-vendor.ps1        # plink + licences
-powershell -ExecutionPolicy Bypass -File tools\build-runtime.ps1       # portable Python + Tk
-python tools\package_release.py                                        # release archive
+powershell -ExecutionPolicy Bypass -File tools\fetch-vendor.ps1        # plink + 许可证
+powershell -ExecutionPolicy Bypass -File tools\build-runtime.ps1       # 便携 Python + Tk
+python tools\package_release.py                                        # 发布压缩包
 ```

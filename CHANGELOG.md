@@ -37,7 +37,8 @@ client timeout, a tunnel drop or an agent restart can no longer be confused with
 - **`tools/package_release.py`** — reproducible zero-install archive with a host-identity
   scan before packaging.
 - **`tools/normalize-lf.py`** — enforces LF on every script that runs on Linux.
-- Bilingual documentation (`README.md`, `README.zh-CN.md`) and `CHANGELOG.md`.
+- Bilingual documentation (`README.md` in Chinese, `README.en.md` in English) and
+  `CHANGELOG.md`.
 
 ### Changed
 
