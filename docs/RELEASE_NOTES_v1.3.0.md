@@ -1,7 +1,7 @@
 # WinLinuxBridge v1.3.0 — Durable Execution
 
 **Release date:** 2026-10-29
-**Archive:** `WinLinuxBridge-1.3.0.zip` (10.6 MB, 1096 files)
+**Archive:** `WinLinuxBridge-1.3.0.zip` (14.2 MB, 1099 files)
 **SHA-256:** see `SHA256SUMS.txt` published with the archive
 **Licence:** MIT
 **Platforms:** Windows 10/11 (no admin) · Linux (no root)
@@ -115,6 +115,26 @@ powershell -ExecutionPolicy Bypass -File tools\verify.ps1
 ~/WinLinuxBridge/tools/verify_jobs.sh
 ~/WinLinuxBridge/tools/verify_cancel.sh
 ```
+
+---
+
+## Verification performed on this build
+
+The archive is not just compiled — it is extracted into an empty directory and executed the
+way an end user would run it:
+
+| Check | Result |
+| --- | --- |
+| Extract `WinLinuxBridge-1.3.0.zip` to a clean directory | 1099 files, no `git/`, no build cache, no credential file |
+| `win\runtime\python.exe -c "import encodings, json, tkinter"` | CPython 3.13.14, Tk 8.6 |
+| `win\WinBridgeGUI.pyw --selftest` | 11 / 11 pass (including a DPAPI encrypt-decrypt round trip) |
+| `win\WinBridgeGUI.pyw --uitest` | 14 / 14 pass |
+| `import winbridge_jobs`, `import winbridge_agent` | job engine and agent load, agent reports 1.3.0 |
+| `tools/verify.ps1` on the source tree | 38 / 38 |
+| `tools/verify.sh` on the Linux host | 20 / 20 |
+| `tools/verify_jobs.sh` / `tools/verify_cancel.sh` | 17 / 17 and 6 / 6 |
+| End-to-end `wl run "ipconfig"` over the reverse tunnel | Windows output returned; `wl doctor` reports agent 1.3.0 |
+| Host-identity scan before packaging | clean — no IP address, account name, host name, key or token in shippable text |
 
 ---
 
