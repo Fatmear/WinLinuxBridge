@@ -33,5 +33,7 @@ Desktop.ini
 .DS_Store
 
 # ---- release output ------------------------------------------------------
-release/
+# The verified archive ships together with its checksums and notes, so one push
+# publishes exactly the bytes that passed acceptance testing.
 *.zip
+!release/WinLinuxBridge-*.zip
