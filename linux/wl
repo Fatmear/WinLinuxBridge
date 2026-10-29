@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+# WinLinuxBridge command line (Linux side).
+#
+# The Windows host dials out and opens a reverse tunnel, so this machine only
+# needs to talk to http://127.0.0.1:<WL_AGENT_PORT>. Nothing listens on the
+# network here and no root/sudo is used.
+#
+# Config:  $HOME/WinLinuxBridge/config/bridge.env  (mode 0600, holds the token)
+# Token:   WL_AGENT_TOKEN
+# Port:    WL_AGENT_PORT  (local end of the reverse tunnel, default 18080)
+#
+# ASCII comments only.
+
+set -uo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+ENV_FILE="$ROOT/config/bridge.env"
+
+if [ -f "$ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+fi
+
+PORT="${WL_AGENT_PORT:-18080}"
+BASE="http://127.0.0.1:${PORT}"
+TOKEN="${WL_AGENT_TOKEN:-}"
+TIMEOUT="${WL_TIMEOUT:-120}"
+# The job client is a python helper; it reads the same variables.
+export WL_AGENT_PORT="$PORT" WL_AGENT_TOKEN="$TOKEN"
+export WL_CONNECT_TIMEOUT="${WL_CONNECT_TIMEOUT:-5}"
+export WL_WAIT_MARGIN="${WL_WAIT_MARGIN:-30}"
+JOB_CLIENT="$ROOT/linux/wl_job.py"
+
+die() { printf 'wl: %s\n' "$*" >&2; exit 1; }
+
+need_token() {
+    [ -n "$TOKEN" ] || die "no token in $ENV_FILE - run install-win.ps1 on the Windows side"
+}
+
+api() { # api METHOD PATH [JSON_BODY]
+    local method="$1" path="$2" body="${3:-}"
+    local -a args=(-sS -m "$TIMEOUT" -X "$method" -H "Authorization: Bearer ${TOKEN}")
+    if [ -n "$body" ]; then
+        args+=(-H 'Content-Type: application/json; charset=utf-8' --data-binary "$body")
+    fi
+    if ! curl "${args[@]}" "${BASE}${path}"; then
+        printf '\nwl: cannot reach %s - is the Windows side running? try: wl status\n' "$BASE" >&2
+        return 7
+    fi
+}
+
+# Prints "out", forwards "err" to stderr, exits with the Windows exit code.
+show_run() {
+    python3 -c '
+import json, sys
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except Exception:
+    sys.stdout.write(raw)
+    sys.exit(0)
+if "error" in d:
+    sys.stderr.write("wl: %s: %s\n" % (d.get("error"), d.get("detail", "")))
+    sys.exit(2)
+sys.stdout.write(d.get("out", ""))
+if d.get("err"):
+    sys.stderr.write(d["err"])
+if d.get("timed_out"):
+    sys.stderr.write("wl: command timed out\n")
+rc = int(d.get("rc", 0))
+sys.exit(0 if rc == 0 else (rc & 0xFF) or 1)
+'
+}
+
+pretty() { python3 -m json.tool --no-ensure-ascii 2>/dev/null || cat; }
+
+usage() {
+    cat <<'EOF'
+WinLinuxBridge (Linux side)
+
+  wl status                  one screen: tunnel, agent, shared dirs
+  wl ping                    agent identity (host, user, screen, python)
+  wl run [opts] <command>    run a command on Windows
+       --shell auto|powershell|cmd|none   --timeout SEC   --cwd PATH
+  wl ps                      list visible Windows windows
+  wl focus <title part>      bring a window to the front
+  wl shot [file.png]         screenshot Windows -> local file
+  wl click <x> <y> [--double|--right|--middle]
+  wl move <x> <y>
+  wl type <text>             type text into the focused window
+  wl key <combo>             e.g. wl key CTRL+S
+  wl copy <text>             set the Windows clipboard
+  wl paste                   read the Windows clipboard
+  wl start <path|url>        open a file, folder or URL on Windows
+  wl http <url> [-X M] [-d BODY] [-H 'K: V']
+  wl ls [path]               list a shared directory
+  wl get <win path> [out]    download a file from Windows
+  wl put <local> [win path]  upload a file to Windows
+  wl rm <win path> [--dir]   delete a file (or an empty dir)
+  wl lanes                   show the shared folder layout
+
+Paths for ls/get/put/rm are relative to the Windows shared folder
+(%USERPROFILE%\WinLinuxBridge) unless absolute; absolute paths must stay
+inside the user profile.
+EOF
+}
+
+cmd="${1:-status}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+status)
+    echo "root      : $ROOT"
+    echo "env file  : $ENV_FILE $([ -f "$ENV_FILE" ] && echo '(found)' || echo '(MISSING)')"
+    echo "agent url : $BASE"
+    echo "token     : $([ -n "$TOKEN" ] && echo "set (${#TOKEN} chars)" || echo 'MISSING')"
+    if command -v ss >/dev/null 2>&1; then
+        if ss -tln 2>/dev/null | grep -q "127.0.0.1:${PORT} "; then
+            echo "tunnel    : LISTENING on 127.0.0.1:${PORT}"
+        else
+            echo "tunnel    : not listening (Windows side down or tunnel broken)"
+        fi
+    fi
+    for d in shared/from_win shared/to_win shared/shared; do
+        n=$(find "$ROOT/$d" -type f 2>/dev/null | wc -l)
+        echo "lane      : $d  ($n files)"
+    done
+    if [ -n "$TOKEN" ]; then
+        echo "--- agent pid ---"
+        api GET /ping | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("no answer"); sys.exit(1)
+if "error" in d:
+    print("agent said: %s (token mismatch between the two sides?)" % d.get("error"))
+    sys.exit(1)
+print("host=%s user=%s version=%s python=%s" % (d.get("host"), d.get("user"), d.get("version"), d.get("python")))
+print("screen=%s session=%s" % (d.get("screen"), d.get("session_id")))
+' && echo "tunnel    : OK (agent answered through the tunnel)" \
+          || echo "tunnel    : agent did not answer"
+    fi
+    ;;
+
+ping)
+    need_token
+    api GET /ping | pretty
+    ;;
+
+doctor)
+    need_token
+    [ -f "$JOB_CLIENT" ] || die "doctor: missing $JOB_CLIENT"
+    exec python3 "$JOB_CLIENT" doctor "$@"
+    ;;
+
+run)
+    need_token
+    [ -f "$JOB_CLIENT" ] || die "run: missing $JOB_CLIENT (delivery folder is incomplete)"
+    exec python3 "$JOB_CLIENT" run "$@"
+    ;;
+
+job)
+    need_token
+    [ -f "$JOB_CLIENT" ] || die "job: missing $JOB_CLIENT (delivery folder is incomplete)"
+    [ $# -gt 0 ] || die "usage: wl job start|status|logs|result|cancel|list ..."
+    sub="$1"; shift
+    case "$sub" in
+    start) exec python3 "$JOB_CLIENT" run "$@" ;;
+    *)     exec python3 "$JOB_CLIENT" "$sub" "$@" ;;
+    esac
+    ;;
+
+batch)
+    need_token
+    [ -f "$JOB_CLIENT" ] || die "batch: missing $JOB_CLIENT"
+    exec python3 "$JOB_CLIENT" batch "$@"
+    ;;
+
+ps)
+    need_token
+    api GET /windows | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for w in d.get("windows", []):
+    x, y, ww, hh = w["rect"]
+    flag = "min" if w.get("minimized") else "   "
+    print("%7d %s %4dx%-4d %s" % (w["pid"], flag, ww, hh, w["title"]))
+'
+    ;;
+
+focus)
+    need_token
+    [ $# -ge 1 ] || die "usage: wl focus <window title part>"
+    body=$(python3 -c 'import json,sys;print(json.dumps({"action":"focus","title":" ".join(sys.argv[1:])}))' -- "$@")
+    api POST /window "$body"
+    echo
+    ;;
+
+shot)
+    need_token
+    out="${1:-$PWD/win-shot-$(date +%Y%m%d_%H%M%S).png}"
+    api POST /screenshot '{"mode":"b64","all_screens":true}' \
+        | python3 -c '
+import base64, json, sys
+d = json.load(sys.stdin)
+if "error" in d:
+    sys.stderr.write("wl: %s: %s\n" % (d["error"], d.get("detail", "")))
+    sys.exit(2)
+data = d.get("b64")
+if not data:
+    sys.stderr.write("wl: agent returned no image data\n")
+    sys.exit(2)
+with open(sys.argv[1], "wb") as fh:
+    fh.write(base64.b64decode(data))
+print("%s  (%d bytes, from %s)" % (sys.argv[1], d.get("size", 0), d.get("path")))
+' "$out"
+    ;;
+
+click)
+    need_token
+    [ $# -ge 2 ] || die "usage: wl click <x> <y> [--double|--right|--middle]"
+    action=click
+    for a in "$@"; do
+        case "$a" in
+        --double) action=double_click ;;
+        --right) action=right_click ;;
+        --middle) action=middle_click ;;
+        esac
+    done
+    body=$(python3 -c 'import json,sys;print(json.dumps({"action":sys.argv[1],"x":int(sys.argv[2]),"y":int(sys.argv[3])}))' "$action" "$1" "$2")
+    api POST /input "$body"
+    echo
+    ;;
+
+move)
+    need_token
+    body=$(python3 -c 'import json,sys;print(json.dumps({"action":"move","x":int(sys.argv[1]),"y":int(sys.argv[2])}))' "$1" "$2")
+    api POST /input "$body"
+    echo
+    ;;
+
+type)
+    need_token
+    [ $# -ge 1 ] || die "usage: wl type <text>"
+    body=$(python3 -c 'import json,sys;print(json.dumps({"action":"type","text":" ".join(sys.argv[1:])}))' -- "$@")
+    api POST /input "$body"
+    echo
+    ;;
+
+key)
+    need_token
+    [ $# -ge 1 ] || die "usage: wl key <combo>   e.g. wl key CTRL+S"
+    body=$(python3 -c 'import json,sys;print(json.dumps({"action":"key","key":sys.argv[1]}))' "$1")
+    api POST /input "$body"
+    echo
+    ;;
+
+copy)
+    need_token
+    body=$(python3 -c 'import json,sys;print(json.dumps({"op":"set","text":" ".join(sys.argv[1:])}))' -- "$@")
+    api POST /clipboard "$body"
+    echo
+    ;;
+
+paste)
+    need_token
+    api POST /clipboard '{"op":"get"}' | python3 -c 'import json,sys;print(json.load(sys.stdin).get("text",""))'
+    ;;
+
+start)
+    need_token
+    [ $# -ge 1 ] || die "usage: wl start <path|url>"
+    body=$(python3 -c 'import json,sys;print(json.dumps({"shell":"cmd","cmd":"start \"\" \"" + sys.argv[1] + "\""}))' "$1")
+    api POST /run "$body" | show_run
+    ;;
+
+http)
+    need_token
+    url=""; method=GET; data=""; hdrs=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        -X|--method) method="${2:-GET}"; shift 2 ;;
+        -d|--data) data="${2:-}"; shift 2 ;;
+        -H|--header) hdrs+=("${2:-}"); shift 2 ;;
+        *) url="$1"; shift ;;
+        esac
+    done
+    [ -n "$url" ] || die "usage: wl http <url> [-X METHOD] [-d BODY] [-H 'K: V']"
+    body=$(python3 - "$url" "$method" "$data" "${hdrs[@]:-}" <<'PY'
+import json, sys
+url, method, data = sys.argv[1], sys.argv[2], sys.argv[3]
+headers = {}
+for h in sys.argv[4:]:
+    if not h or ":" not in h:
+        continue
+    k, v = h.split(":", 1)
+    headers[k.strip()] = v.strip()
+d = {"url": url, "method": method}
+if data:
+    d["body"] = data
+if headers:
+    d["headers"] = headers
+print(json.dumps(d))
+PY
+)
+    api POST /http "$body" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if "error" in d:
+    sys.stderr.write("wl: %s: %s\n" % (d["error"], d.get("detail", "")))
+    sys.exit(2)
+sys.stderr.write("status=%s size=%s\n" % (d.get("status"), d.get("size")))
+if d.get("text") is not None:
+    sys.stdout.write(d["text"])
+else:
+    sys.stdout.write("[binary payload omitted, %s bytes]\n" % d.get("size"))
+'
+    ;;
+
+ls)
+    need_token
+    path="${1:-.}"
+    body=$(python3 -c 'import json,sys;print(json.dumps({"op":"list","path":sys.argv[1]}))' "$path")
+    api POST /fs "$body" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if "error" in d:
+    sys.stderr.write("wl: %s: %s\n" % (d["error"], d.get("detail", "")))
+    sys.exit(2)
+print(d["path"])
+for e in d["entries"]:
+    kind = "d" if e["type"] == "dir" else "-"
+    print("  %s %10d  %s  %s" % (kind, e["size"], e["mtime"], e["name"]))
+'
+    ;;
+
+get)
+    need_token
+    [ $# -ge 1 ] || die "usage: wl get <win path> [local out]"
+    src="$1"; out="${2:-$(basename "$1")}"
+    body=$(python3 -c 'import json,sys;print(json.dumps({"op":"read","path":sys.argv[1]}))' "$src")
+    api POST /fs "$body" | python3 -c '
+import base64, json, sys
+d = json.load(sys.stdin)
+if "error" in d:
+    sys.stderr.write("wl: %s: %s\n" % (d["error"], d.get("detail", "")))
+    sys.exit(2)
+if d.get("b64"):
+    raw = base64.b64decode(d["b64"])
+else:
+    raw = d.get("text", "").encode("utf-8")
+with open(sys.argv[1], "wb") as fh:
+    fh.write(raw)
+print("%s (%d bytes, from %s)" % (sys.argv[1], len(raw), d.get("path")))
+' "$out"
+    ;;
+
+put)
+    need_token
+    [ $# -ge 1 ] || die "usage: wl put <local file> [win path]"
+    local_file="$1"; dst="${2:-$(basename "$1")}"
+    [ -f "$local_file" ] || die "no such file: $local_file"
+    body=$(python3 - "$local_file" "$dst" <<'PY'
+import base64, json, sys
+with open(sys.argv[1], "rb") as fh:
+    raw = fh.read()
+print(json.dumps({"op": "write", "path": sys.argv[2], "b64": base64.b64encode(raw).decode("ascii")}))
+PY
+)
+    api POST /fs "$body" | pretty
+    ;;
+
+rm)
+    need_token
+    [ $# -ge 1 ] || die "usage: wl rm <win path> [--dir]"
+    rec=false; p=""
+    for a in "$@"; do
+        case "$a" in
+        --dir) rec=true ;;
+        *) p="$a" ;;
+        esac
+    done
+    body=$(python3 -c 'import json,sys;print(json.dumps({"op":"rm","path":sys.argv[1],"recursive":sys.argv[2]=="1"}))' "$p" "$([ "$rec" = true ] && echo 1 || echo 0)")
+    api POST /fs "$body" | pretty
+    ;;
+
+lanes)
+    echo "Windows mirror : %USERPROFILE%\\WinLinuxBridge"
+    echo "Linux folder   : $ROOT"
+    echo
+    echo "shared/from_win  Windows writes -> Linux reads"
+    echo "shared/to_win    Linux writes   -> Windows reads"
+    echo "shared/shared    both write     -> newest wins (deletions are not mirrored)"
+    echo
+    for d in shared/from_win shared/to_win shared/shared; do
+        echo "--- $d"
+        ls -lt "$ROOT/$d" 2>/dev/null | sed -n '2,8p'
+    done
+    ;;
+
+help|-h|--help)
+    usage
+    ;;
+
+*)
+    echo "wl: unknown command '$cmd'" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
