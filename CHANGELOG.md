@@ -52,6 +52,9 @@ Event-driven execution, observable deployment and windowless background operatio
   EOF never completed. GUI command execution now waits for the installer itself,
   stops its blocking reader with `CancelSynchronousIo` and drains trailing output
   without stopping the supervisor or tunnel.
+- Supervisor startup explicitly separates all standard handles from the installer
+  and closes inherited handles while retaining no-console creation. Its durable
+  logs still reach the GUI; later console writes cannot break after installer exit.
 - Worker completion, status updates and button unlocking are delivered through
   the UI queue. Configuration is captured on the UI thread, and repeated status
   refreshes are coalesced instead of reading or mutating Tk controls from workers.
@@ -93,7 +96,7 @@ Event-driven execution, observable deployment and windowless background operatio
 ### Verification
 
 - Windows `tools/verify.ps1 -Port 19887`: 44/44 checks passed, including the new
-  no-console and filesystem-event live-log checks. GUI checks: 11 selftests and 58 UI checks.
+  no-console and filesystem-event live-log checks. GUI checks: 11 selftests and 62 UI checks.
 - No universal speedup multiplier is claimed: workload, shell, storage and tunnel
   latency differ. Structured `--exe` + argument lists remain the preferred shell-free path.
 - Live Linux installation, reconnect and login/watchdog execution were not revalidated

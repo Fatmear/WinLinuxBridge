@@ -314,11 +314,13 @@ if (-not $NoStart) {
     else { Warn 'watchdog refresh failed; see registration error above (Startup entry remains active)' }
 
     Write-WbLog 'install: starting supervisor' 'install'
-    $child = Start-WbBackgroundProcess -FilePath 'powershell.exe' -Arguments @(
-        '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-        '-WindowStyle', 'Hidden', '-File', $supervisor
-    )
-    $child.Process.Dispose()
+    $python = Get-WbPython
+    if (-not $python) { throw 'cannot start supervisor: Python runtime is missing' }
+    $launcherCode = 'import subprocess,sys; child=subprocess.Popen(["powershell.exe","-NoLogo","-NoProfile","-ExecutionPolicy","Bypass","-WindowStyle","Hidden","-File",sys.argv[1]],cwd=sys.argv[2],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,close_fds=True,creationflags=0x08000000|0x00000200);print(child.pid)'
+    $launchArgs = @($python.Args) + @('-B', '-c', $launcherCode, $supervisor, (Split-Path -Parent $supervisor))
+    $launch = Invoke-WbProcess -FilePath $python.Exe -Arguments $launchArgs -TimeoutSec 30
+    if ($launch.rc -ne 0) { throw ('supervisor launch failed: ' + $launch.out) }
+    Ok ('supervisor started without inherited installer handles: pid ' + $launch.out.Trim())
     Start-Sleep -Seconds 8
 
     $okAgent = Test-WbAgent -Conf $conf

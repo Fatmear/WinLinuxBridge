@@ -1345,6 +1345,8 @@ def _test_worker_lifecycle(app, need) -> None:
     kernel32.OpenProcess.restype = wt.HANDLE
     kernel32.GetExitCodeProcess.argtypes = (wt.HANDLE, ctypes.POINTER(wt.DWORD))
     kernel32.TerminateProcess.argtypes = (wt.HANDLE, wt.UINT)
+    kernel32.WaitForSingleObject.argtypes = (wt.HANDLE, wt.DWORD)
+    kernel32.WaitForSingleObject.restype = wt.DWORD
     baseline = {thread.ident for thread in threading.enumerate()
                 if thread.name in ("log-follow", "ps-output")}
     original_refresh = app.refresh_status
@@ -1437,7 +1439,7 @@ def _test_worker_lifecycle(app, need) -> None:
                         if os.path.isfile(pid_path):
                             with open(pid_path, encoding="ascii") as source:
                                 child_handle = kernel32.OpenProcess(
-                                    0x1001, False, int(source.read().strip()))
+                                    0x101001, False, int(source.read().strip()))
                         exit_code = wt.DWORD()
                         alive = (child_handle and kernel32.GetExitCodeProcess(
                             child_handle, ctypes.byref(exit_code))
@@ -1453,6 +1455,8 @@ def _test_worker_lifecycle(app, need) -> None:
                         app.after_cancel(guard)
                     if child_handle:
                         kernel32.TerminateProcess(child_handle, 0)
+                        if kernel32.WaitForSingleObject(child_handle, 5000) != 0:
+                            raise RuntimeError("fixture child did not exit")
                         kernel32.CloseHandle(child_handle)
                     kernel32.CloseHandle(gate)
     finally:
@@ -1480,6 +1484,87 @@ def _test_worker_lifecycle(app, need) -> None:
             follower.stop()
             follower.join(timeout=2)
         need(not follower.is_alive(), "log-notification-stop-interrupts-wait")
+
+    with tempfile.TemporaryDirectory(prefix="wlb-gui-detached-") as directory:
+        event_name = "Local\\WlbGui-" + os.path.basename(directory)
+        gate = kernel32.CreateEventW(None, True, False, event_name)
+        child_handle = None
+        console_ready = threading.Event()
+        wrote_after_exit = threading.Event()
+        probe_path = os.path.join(directory, "probe.log")
+        supervisor = os.path.join(directory, "supervisor.ps1")
+        parent = os.path.join(directory, "parent.ps1")
+        child_text = (
+            "Add-Type -TypeDefinition 'using System; using "
+            "System.Runtime.InteropServices; public static class "
+            "WlbGuiConsoleProbe { [DllImport(\"kernel32.dll\")] "
+            "public static extern IntPtr GetConsoleWindow(); }'\n"
+            "$gate = [Threading.EventWaitHandle]::OpenExisting('%s')\n"
+            "Write-Host 'background-before'\n"
+            "$window = [WlbGuiConsoleProbe]::GetConsoleWindow().ToInt64()\n"
+            "[IO.File]::WriteAllText('%s', 'window=' + $window "
+            "+ [Environment]::NewLine)\n"
+            "$null = $gate.WaitOne(8000)\n"
+            "Write-Host 'background-after'\n"
+            "[IO.File]::AppendAllText('%s', 'after' "
+            "+ [Environment]::NewLine)\n"
+        ) % (event_name, probe_path.replace("'", "''"),
+             probe_path.replace("'", "''"))
+        parent_text = (
+            ". '%s'\n"
+            "$tokens = $null; $errors = $null\n"
+            "$ast = [Management.Automation.Language.Parser]::ParseFile("
+            "'%s', [ref]$tokens, [ref]$errors)\n"
+            "$node = $ast.Find({ param($node) $node -is "
+            "[Management.Automation.Language.AssignmentStatementAst] "
+            "-and $node.Left -is "
+            "[Management.Automation.Language.VariableExpressionAst] "
+            "-and $node.Left.VariablePath.UserPath -eq 'launcherCode' }, "
+            "$true)\n"
+            "$code = $node.Right.Expression.Value\n"
+            "if (-not $code) { throw 'missing installer launcher code' }\n"
+            "$result = Invoke-WbProcess -FilePath '%s' "
+            "-Arguments @('-B','-c',$code,'%s','%s') -TimeoutSec 10\n"
+            "if ($result.rc -ne 0) { throw $result.out }\n"
+            "Write-Output $result.out.Trim()\n"
+        ) % (os.path.join(SCRIPT_DIR, "winbridge_common.ps1").replace("'", "''"),
+             PS_INSTALL.replace("'", "''"), sys.executable.replace("'", "''"),
+             supervisor.replace("'", "''"), directory.replace("'", "''"))
+        for path, text in ((supervisor, child_text), (parent, parent_text)):
+            with open(path, "w", encoding="utf-8-sig") as output:
+                output.write(text)
+
+        def receive_probe(line):
+            if line == "[probe] window=0":
+                console_ready.set()
+            elif line == "[probe] after":
+                wrote_after_exit.set()
+
+        follower = LogFollower(directory, ["probe.log"], receive_probe)
+        follower.start()
+        try:
+            follower.ready.wait(2)
+            lines = []
+            result = run_ps_stream(parent, on_line=lines.append, timeout=10)
+            pids = [line for line in lines if line.isdigit()]
+            need(result == 0 and len(pids) == 1,
+                 "detached-launch-installer-exited")
+            if len(pids) == 1:
+                child_handle = kernel32.OpenProcess(0x101001, False, int(pids[0]))
+            need(console_ready.wait(6), "detached-supervisor-no-console")
+            kernel32.SetEvent(gate)
+            need(wrote_after_exit.wait(6),
+                 "detached-supervisor-writes-after-installer-exit")
+        finally:
+            if child_handle:
+                kernel32.TerminateProcess(child_handle, 0)
+                if kernel32.WaitForSingleObject(child_handle, 5000) != 0:
+                    raise RuntimeError("fixture supervisor did not exit")
+                kernel32.CloseHandle(child_handle)
+            kernel32.CloseHandle(gate)
+            follower.stop()
+            follower.join(timeout=2)
+        need(not follower.is_alive(), "detached-launch-no-log-thread-leak")
 
 
 def uitest() -> int:
