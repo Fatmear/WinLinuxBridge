@@ -1062,7 +1062,7 @@ class WinBridgeApp(tk.Tk):
         remote = self.var["remote"].get().strip()
         local = self.var["local"].get().strip()
         conf = self.collect_conf()
-        password = self.var["password"].get()
+        credential = self.var["password"].get()
         remember = self.var["remember"].get()
 
         fp = self.fingerprint or probe_host_key(host, user, port)
@@ -1084,8 +1084,8 @@ class WinBridgeApp(tk.Tk):
         def job():
             write_conf(conf)
             if remember:
-                save_password(password)
-            env = {"WL_LINUX_PASSWORD": password}
+                save_password(credential)
+            env = {"WL_LINUX_PASSWORD": credential}
             self.emit("开始部署：装密钥 → 上传程序 → 配置令牌 → 注册自启", "cmd")
             self.emit("首次上传包含便携运行时，约 30 MB，请稍候。", "dim")
             rc = run_ps_stream(PS_INSTALL, args, self._install_line,
