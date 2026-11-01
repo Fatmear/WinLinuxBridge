@@ -268,8 +268,8 @@ if (-not (Test-Path -LiteralPath $supervisor)) {
 $null = Register-WbAutostart -SupervisorPath $supervisor
 Ok $startupCmd
 
-$watchdogCmd = Join-Path $localRoot 'win\start-win.cmd'
-if (-not (Test-Path -LiteralPath $watchdogCmd)) { $watchdogCmd = Join-Path $PSScriptRoot 'start-win.cmd' }
+$watchdogCmd = Join-Path $localRoot 'win\start-win.vbs'
+if (-not (Test-Path -LiteralPath $watchdogCmd)) { $watchdogCmd = Join-Path $PSScriptRoot 'start-win.vbs' }
 if (Register-WbWatchdog -StartCmdPath $watchdogCmd) { Ok 'scheduled task WinLinuxBridge-Watchdog (5 min)' }
 else { Warn 'scheduled task not created (not fatal; Startup entry still autostarts the bridge)' }
 
@@ -297,25 +297,21 @@ if (-not $NoStart) {
     # The mirror must contain the supervisor, otherwise autostart and start-win
     # point at nothing. Fall back to the folder this installer runs from.
     $supervisor = Join-Path $localRoot 'win\winbridge_supervisor.ps1'
-    $startCmd = Join-Path $localRoot 'win\start-win.cmd'
+    $startCmd = Join-Path $localRoot 'win\start-win.vbs'
     if (-not (Test-Path -LiteralPath $supervisor)) {
         Warn ('mirror is incomplete: ' + $supervisor + ' is missing')
         Warn ('using ' + $PSScriptRoot + ' instead; copy the delivery folder to ' + $localRoot)
         $supervisor = Join-Path $PSScriptRoot 'winbridge_supervisor.ps1'
-        $startCmd = Join-Path $PSScriptRoot 'start-win.cmd'
+        $startCmd = Join-Path $PSScriptRoot 'start-win.vbs'
     }
     if (-not (Test-Path -LiteralPath $startCmd)) { throw ('cannot start: ' + $startCmd + ' is missing') }
 
     # The mirror is complete now: point autostart at the mirror copy if it was
     # registered against the installer folder earlier.
-    if ($supervisor -ne (Join-Path $localRoot 'win\winbridge_supervisor.ps1') -and
-        (Test-Path -LiteralPath (Join-Path $localRoot 'win\winbridge_supervisor.ps1'))) {
-        $null = Register-WbAutostart -SupervisorPath (Join-Path $localRoot 'win\winbridge_supervisor.ps1')
-        Ok ('autostart repointed to ' + (Join-Path $localRoot 'win\winbridge_supervisor.ps1'))
-    }
-    if ($watchdogCmd -ne $startCmd -and (Test-Path -LiteralPath $startCmd)) {
-        if (Register-WbWatchdog -StartCmdPath $startCmd) { Ok 'watchdog repointed to the mirror' }
-    }
+    $null = Register-WbAutostart -SupervisorPath $supervisor
+    Ok ('autostart refreshed: ' + $supervisor)
+    if (Register-WbWatchdog -StartCmdPath $startCmd) { Ok 'watchdog refreshed after mirror update' }
+    else { Warn 'watchdog refresh failed; see registration error above (Startup entry remains active)' }
 
     Write-WbLog 'install: starting supervisor' 'install'
     $child = Start-WbBackgroundProcess -FilePath 'powershell.exe' -Arguments @(

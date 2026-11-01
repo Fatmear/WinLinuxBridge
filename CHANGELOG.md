@@ -22,8 +22,9 @@ Event-driven execution, observable deployment and windowless background operatio
   process spawn/run, completion detection, metadata writes and result construction.
 - `win/start-gui.vbs` and `win/start-win.vbs` as default windowless launchers;
   scheduled watchdog and login startup use windowless entries instead of `.cmd`.
-- Three regression checks covering no-console process creation, argument/output/exit
-  preservation, live background logs and windowless entry points (41 checks total).
+- Six regression checks covering no-console process creation, argument/output/exit
+  preservation, live background logs, windowless entries, structured watchdog registration,
+  post-mirror startup refresh and expected HTTP disconnects (44 checks total).
 
 ### Changed
 
@@ -62,10 +63,19 @@ Event-driven execution, observable deployment and windowless background operatio
   generated startup entries now use UTF-16.
 - Packaging scans Pythonw/VBS entry points too, and uses Python AST values to avoid
   mistaking password type annotations or boolean arguments for hardcoded credentials.
+- **Same-version rebuild on 2026-11-01:** normal TCP resets and broken pipes no longer
+  print misleading request-processing tracebacks; unexpected exceptions remain visible.
+- Watchdog registration now uses structured ScheduledTasks actions with the current
+  interactive user and limited privilege, rather than nested `schtasks /TR` quoting.
+  Registration failures retain their exact diagnostic instead of only a generic warning.
+- Installer startup/watchdog migration is retried unconditionally after mirror refresh,
+  with VBS-aware fallback before refresh, even when the mirror path is unchanged.
+- Watchdog regression mocks explicitly load the task module first and refuse to run
+  if the real registration function is still selected, preventing live-task side effects.
 
 ### Verification
 
-- Windows `tools/verify.ps1 -Port 19887`: 41/41 checks passed, including the new
+- Windows `tools/verify.ps1 -Port 19887`: 44/44 checks passed, including the new
   no-console and filesystem-event live-log checks. GUI checks: 11 selftests and 14 UI checks.
 - No universal speedup multiplier is claimed: workload, shell, storage and tunnel
   latency differ. Structured `--exe` + argument lists remain the preferred shell-free path.

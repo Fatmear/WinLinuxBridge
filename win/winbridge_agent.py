@@ -999,6 +999,12 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "WinBridge/" + VERSION
     protocol_version = "HTTP/1.1"
 
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError):
+            log.debug("client disconnected: %s", self.client_address)
+
     def log_message(self, fmt, *args):  # route BaseHTTPRequestHandler logs to ours
         log.debug("%s %s", self.address_string(), fmt % args)
 
@@ -1086,6 +1092,9 @@ class Handler(BaseHTTPRequestHandler):
                 payload["_perf_recv_ms"] = t_recv
             result = handler(payload)
             self._json(200, result if isinstance(result, dict) else {"result": result})
+        except (ConnectionResetError, BrokenPipeError):
+            self.close_connection = True
+            log.debug("client disconnected during response: %s", path)
         except PermissionError as exc:
             self._json(403, {"error": "permission denied", "detail": str(exc)})
         except FileNotFoundError as exc:

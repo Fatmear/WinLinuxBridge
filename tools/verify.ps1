@@ -229,8 +229,123 @@ Check 'windowless launchers ship and watchdog avoids cmd' {
         if ($body -notmatch ', 0, False' -or $body -match 'cmd\.exe') { throw ('not windowless: ' + $relative) }
     }
     $common = [IO.File]::ReadAllText((Join-Path $root 'win\winbridge_common.ps1'))
-    if ($common -notmatch 'wscript\.exe //B //Nologo') { throw 'watchdog has no windowless entry' }
+    if ($common -notmatch 'New-ScheduledTaskAction[^\r\n]*wscript\.exe' -or $common -notmatch '//B //Nologo') {
+        throw 'watchdog has no structured windowless entry'
+    }
     'GUI/daemon VBS launchers and wscript watchdog present'
+}
+
+Check 'watchdog uses current-user structured registration and diagnoses failure' {
+    Import-Module ScheduledTasks -ErrorAction Stop
+    $savedRegistration = (Get-Command Register-ScheduledTask).ScriptBlock
+    $savedLog = (Get-Item Function:Write-WbLog).ScriptBlock
+    $global:wlWatchdogProbe = @{ Failure = $false; Logs = @(); Parameters = $null }
+    function script:Write-WbLog {
+        param([string]$Message, [string]$Source)
+        $global:wlWatchdogProbe.Logs += $Message
+    }
+    function script:Register-ScheduledTask {
+        [CmdletBinding()]
+        param($TaskName, $Action, $Trigger, $Principal, $Settings, [switch]$Force)
+        if ($global:wlWatchdogProbe.Failure) { throw 'simulated registration denial' }
+        $global:wlWatchdogProbe.Parameters = @{
+            TaskName = $TaskName; Action = $Action; Trigger = $Trigger; Principal = $Principal; Settings = $Settings
+        }
+    }
+    try {
+        if ((Get-Command Register-ScheduledTask).ModuleName -eq 'ScheduledTasks') {
+            throw 'registration mock is not active; refusing to modify real scheduled tasks'
+        }
+        if (-not (Register-WbWatchdog -StartCmdPath (Join-Path $root 'win\start-win.vbs'))) {
+            throw 'structured registration failed'
+        }
+        $probe = $global:wlWatchdogProbe.Parameters
+        if ($probe.TaskName -ne 'WinLinuxBridge-Watchdog' -or
+            $probe.Action.Execute -notmatch 'wscript\.exe$' -or
+            $probe.Action.Arguments -notmatch '^//B //Nologo ".*start-win\.vbs"$' -or
+            $probe.Trigger.Repetition.Interval -ne 'PT5M' -or
+            $probe.Principal.UserId -ne [Security.Principal.WindowsIdentity]::GetCurrent().Name -or
+            $probe.Principal.RunLevel.ToString() -ne 'Limited') {
+            throw ('watchdog definition mismatch: action={0}, args={1}, interval={2}, privilege={3}' -f
+                $probe.Action.Execute, $probe.Action.Arguments, $probe.Trigger.Repetition.Interval, $probe.Principal.RunLevel)
+        }
+        $global:wlWatchdogProbe.Failure = $true
+        if (Register-WbWatchdog -StartCmdPath (Join-Path $root 'win\start-win.vbs')) { throw 'denial reported as success' }
+        if (($global:wlWatchdogProbe.Logs -join ' ') -notmatch 'simulated registration denial') { throw 'failure reason missing' }
+        'structured API, current user, limited privilege, 5 minutes; failure reason retained'
+    } finally {
+        Set-Item Function:Register-ScheduledTask -Value $savedRegistration
+        Set-Item Function:Write-WbLog -Value $savedLog
+        Remove-Variable wlWatchdogProbe -Scope Global
+    }
+}
+
+Check 'installer always refreshes startup and watchdog after mirror update' {
+    $body = [IO.File]::ReadAllText((Join-Path $root 'win\install-win.ps1'))
+    $marker = $body.IndexOf("Step 'Refreshing the local mirror and starting the bridge'")
+    if ($marker -lt 0) { throw 'mirror refresh marker missing' }
+    $refresh = $body.Substring($marker)
+    if (-not $refresh.Contains('$null = Register-WbAutostart -SupervisorPath $supervisor') -or
+        -not $refresh.Contains('Register-WbWatchdog -StartCmdPath $startCmd') -or
+        $refresh -match '\$watchdogCmd\s+-ne' -or
+        -not $body.Contains("Join-Path " + '$PSScriptRoot' + " 'start-win.vbs'")) {
+        throw 'startup/watchdog refresh is still gated by old path identity'
+    }
+    'VBS-aware fallback and unconditional post-mirror refresh'
+}
+
+Check 'HTTP reset is quiet while unexpected errors remain visible' {
+    $script = Join-Path ([IO.Path]::GetTempPath()) ('wl-reset-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.py')
+    $code = @(
+        'import sys, socket, struct, threading',
+        'from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer',
+        'from unittest import mock',
+        'sys.path.insert(0, sys.argv[1])',
+        'import winbridge_agent as agent',
+        'finished = threading.Event()',
+        'server_errors = []',
+        'original = agent.Handler.handle',
+        'def tracked(handler):',
+        '    try: original(handler)',
+        '    finally: finished.set()',
+        'server = ThreadingHTTPServer(("127.0.0.1", 0), agent.Handler)',
+        'server.handle_error = lambda request, address: server_errors.append(address)',
+        'try:',
+        '    with mock.patch.object(agent.Handler, "handle", tracked):',
+        '        worker = threading.Thread(target=server.serve_forever, daemon=True)',
+        '        worker.start()',
+        '        connection = socket.create_connection(server.server_address)',
+        '        connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("hh", 1, 0))',
+        '        connection.close()',
+        '        assert finished.wait(5), "reset connection was not handled"',
+        '        assert not server_errors, server_errors',
+        '    handler = object.__new__(agent.Handler)',
+        '    handler.client_address = ("127.0.0.1", 1)',
+        '    handler.path = "/ping"',
+        '    handler._authorized = lambda: True',
+        '    handler._json = mock.Mock(side_effect=BrokenPipeError())',
+        '    with mock.patch.object(agent.log, "error") as error:',
+        '        handler._dispatch("GET")',
+        '        assert handler.close_connection',
+        '        error.assert_not_called()',
+        '    with mock.patch.object(BaseHTTPRequestHandler, "handle", side_effect=RuntimeError("unexpected")):',
+        '        try: original(handler)',
+        '        except RuntimeError: pass',
+        '        else: raise AssertionError("unexpected exception was hidden")',
+        '    print("real TCP reset and response disconnect quiet; unexpected errors propagate")',
+        'finally:',
+        '    server.shutdown()',
+        '    server.server_close()'
+    ) -join "`n"
+    [IO.File]::WriteAllText($script, $code, (New-Object Text.UTF8Encoding($false)))
+    try {
+        $result = Invoke-WbProcess -FilePath (Join-Path $root 'win\runtime\python.exe') `
+            -Arguments @('-B', $script, (Join-Path $root 'win')) -TimeoutSec 15
+        if ($result.rc -ne 0) { throw $result.out }
+        $result.out
+    } finally {
+        [IO.File]::Delete($script)
+    }
 }
 
 Check 'GUI headless selftest' {

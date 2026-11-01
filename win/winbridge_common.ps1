@@ -116,12 +116,23 @@ function Write-WbLog {
 function Register-WbWatchdog {
     param([string]$StartCmdPath)
     $launcher = Join-Path (Split-Path -Parent $StartCmdPath) 'start-win.vbs'
-    if (-not (Test-Path -LiteralPath $launcher)) { return $false }
-    $command = 'wscript.exe //B //Nologo "' + $launcher + '"'
-    $result = Invoke-WbProcess -FilePath 'schtasks.exe' -Arguments @(
-        '/Create', '/F', '/SC', 'MINUTE', '/MO', '5', '/TN', 'WinLinuxBridge-Watchdog', '/TR', $command
-    )
-    return ($result.rc -eq 0)
+    try {
+        if (-not (Test-Path -LiteralPath $launcher)) { throw ('launcher missing: ' + $launcher) }
+        $action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\wscript.exe') `
+            -Argument ('//B //Nologo "' + $launcher + '"')
+        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
+            -RepetitionInterval ([TimeSpan]::FromMinutes(5))
+        $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+            -LogonType Interactive -RunLevel Limited
+        $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
+            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        $null = Register-ScheduledTask -TaskName 'WinLinuxBridge-Watchdog' -Action $action `
+            -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop
+        return $true
+    } catch {
+        Write-WbLog ('watchdog: registration failed: ' + $_.Exception.Message) 'install'
+        return $false
+    }
 }
 
 function Get-WbPython {
