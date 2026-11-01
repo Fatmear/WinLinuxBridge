@@ -303,6 +303,8 @@ def step_progress(line: str):
     if not text.startswith("=="):
         return None, None
     body = text[2:].strip().lower()
+    if body == "done":
+        return 100, "部署完成"
     for marker, pct, phase in INSTALL_STEPS:
         if body.startswith(marker):
             return pct, phase
@@ -1299,6 +1301,18 @@ def uitest() -> int:
     need(len(app.status_labels) == 3, "status-lights=3")
     need("host" in app.var and app.var["host"].get() is not None, "host-field-present")
     need(app.var["local"].get() != "", "local-default-present")
+
+    app._install_line("== Refreshing the local mirror and starting the bridge")
+    app._drain()
+    need(int(app.progress["value"]) == 94, "install-progress-mirror=94")
+    app._install_line("== Done")
+    app._drain()
+    need(int(app.progress["value"]) == 100, "install-progress-done=100")
+    need(app.pct_var.get() == "100%", "install-percent-done=100")
+    need(app.phase_var.get() == "部署完成", "install-phase-done")
+    need(step_progress("done") == (None, None), "ignore-ordinary-done")
+    need(step_progress("== Done failed") == (None, None),
+         "ignore-nonterminal-done")
 
     try:
         app.destroy()

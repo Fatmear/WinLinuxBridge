@@ -47,6 +47,10 @@ Event-driven execution, observable deployment and windowless background operatio
 
 ### Fixed
 
+- GUI installation progress reaches 100% as soon as the installer emits the
+  exact `== Done` completion marker, rather than remaining at 94% until process
+  exit and output-pipe closure. GUI regression checks cover the progress bar,
+  percentage label, completion phase and unrelated `done` log text.
 - Missing `JobManager` flush/cache/timing helpers and persistence constants crashed
   agent startup despite successful syntax checks.
 - Cancellation racing with the process-exit event could be reported as `FAILED`
