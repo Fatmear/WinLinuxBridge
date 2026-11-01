@@ -34,7 +34,7 @@ import webbrowser
 from datetime import datetime
 
 APP_NAME = "WinLinuxBridge"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 HOME = os.path.expanduser("~")
@@ -260,7 +260,7 @@ def write_autostart_vbs(supervisor: str) -> str:
         "sh.Run \"powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass \" & _\r\n"
         "       \"-WindowStyle Hidden -File \"\"%s\"\"\", 0, False\r\n" % quoted
     )
-    with open(target, "w", encoding="ascii", newline="") as fh:
+    with open(target, "w", encoding="utf-16", newline="") as fh:
         fh.write(body)
     legacy = autostart_path(".cmd")
     if os.path.isfile(legacy):
@@ -1047,9 +1047,10 @@ class WinBridgeApp(tk.Tk):
     def on_start(self) -> None:
         """Starts the supervisor with no console window at all.
 
-        CREATE_NO_WINDOW means there is no window to flash or minimise, and
-        DETACHED_PROCESS means closing this panel does not take the daemon down.
-        Its output is written to the logs folder under the user profile and`n        streamed back in here by LogFollower, so nothing is printed outside this`n        window.
+        CREATE_NO_WINDOW prevents console creation without DETACHED_PROCESS,
+        which would override that flag. Closing the panel leaves the daemon up.
+        Its output is written to the logs folder under the user profile and
+        streamed back in here by LogFollower.
         """
         conf = self.collect_conf()
         local = conf.get("WL_LOCAL_ROOT") or DEFAULTS["WL_LOCAL_ROOT"]
@@ -1066,7 +1067,7 @@ class WinBridgeApp(tk.Tk):
                 argv, cwd=os.path.dirname(supervisor),
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                creationflags=0x08000000 | 0x00000008,
+                creationflags=0x08000000 | 0x00000200,
             )
             self.emit("已启动后台守护（无窗口，约 10 秒后就绪）", "ok")
             self.emit("守护日志会实时出现在这里（logs\\supervisor.log 等）", "dim")

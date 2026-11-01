@@ -6,6 +6,74 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.4.0] - 2026-11-01
+
+Event-driven execution, observable deployment and windowless background operation.
+
+### Added
+
+- Installation progress with named phases and percentages in the GUI; installer,
+  update and verification output is streamed into the existing log panel.
+- Filesystem-event log following with `ReadDirectoryChangesW` for supervisor, tunnel
+  and agent logs, without repeatedly rereading the whole log files.
+- Optional bounded `/job/start` submit-and-wait: short tasks return their result in
+  the start response; longer tasks retain their durable job identity for follow-up.
+- Millisecond phase timings for request parsing, command preparation, queueing,
+  process spawn/run, completion detection, metadata writes and result construction.
+- `win/start-gui.vbs` and `win/start-win.vbs` as default windowless launchers;
+  scheduled watchdog and login startup use windowless entries instead of `.cmd`.
+- Three regression checks covering no-console process creation, argument/output/exit
+  preservation, live background logs and windowless entry points (41 checks total).
+
+### Changed
+
+- Job status is memory-first and waits on a condition variable. Process completion
+  blocks on the operating system wait and notifies an event instead of fixed 150 ms
+  process polling; synchronous `/run` uses the same terminal-state wait.
+- Noncritical heartbeat metadata is merged by a background event-driven flusher
+  (default 2 seconds, configurable 1–5 seconds) without per-heartbeat `fsync`.
+  Critical identity/state/pid/exit/cancellation/result changes remain atomic and durable.
+- The heartbeat interval defaults to 1 second. Safety timeout/output-cap checks still
+  run periodically; folder synchronization and GUI health refresh are not fully event-driven.
+- Linux synchronous execution waits up to 8 seconds in the start call by default;
+  subsequent status requests use 15-second long polling rather than 2-second sleep polling.
+- Background SSH/SCP, key generation, host-key probing, token ACL updates, installer
+  refresh, agent and tunnel launches explicitly prevent console creation. Captured
+  stdout/stderr and background log files remain available.
+- Packaging executes a real task with the portable runtime before replacing an archive.
+- Release output is ignored and no longer tracked in Git; distributable archives,
+  checksums and release notes are attached to GitHub Releases.
+
+### Fixed
+
+- Missing `JobManager` flush/cache/timing helpers and persistence constants crashed
+  agent startup despite successful syntax checks.
+- Cancellation racing with the process-exit event could be reported as `FAILED`
+  instead of `CANCELLED`; cancellation intent is persisted before terminating the job.
+- Delayed heartbeat snapshots could overwrite final metadata; snapshot writes and
+  critical transitions are serialized by the same lock.
+- Installation reported success after agent startup or Linux end-to-end checks failed.
+  These failures now produce a nonzero installer result and an actionable error.
+- Background operations could briefly show a black console because direct native
+  invocation and `.cmd` startup bypassed the GUI's hidden-process flags.
+- GUI combined `CREATE_NO_WINDOW` with `DETACHED_PROCESS`, which overrides the former;
+  it now uses a separate process group while retaining no-console creation.
+- Autostart paths containing non-ASCII characters were not representable in ASCII VBS;
+  generated startup entries now use UTF-16.
+- Packaging scans Pythonw/VBS entry points too, and uses Python AST values to avoid
+  mistaking password type annotations or boolean arguments for hardcoded credentials.
+
+### Verification
+
+- Windows `tools/verify.ps1 -Port 19887`: 41/41 checks passed, including the new
+  no-console and filesystem-event live-log checks. GUI checks: 11 selftests and 14 UI checks.
+- No universal speedup multiplier is claimed: workload, shell, storage and tunnel
+  latency differ. Structured `--exe` + argument lists remain the preferred shell-free path.
+- Live Linux installation, reconnect and login/watchdog execution were not revalidated
+  on a remote deployment for this release; upgrading must refresh existing startup records.
+
+---
+
 ## [1.3.0] - 2026-10-29
 
 Durable execution. This release rebuilds the execution layer around persisted jobs, so that a
@@ -139,6 +207,7 @@ First end-to-end release.
 
 ---
 
+[1.4.0]: https://github.com/Fatmear/WinLinuxBridge/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/Fatmear/WinLinuxBridge/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/Fatmear/WinLinuxBridge/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/Fatmear/WinLinuxBridge/releases/tag/v1.1.0

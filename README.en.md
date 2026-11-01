@@ -12,7 +12,7 @@ inbound port, no port forwarding, no admin rights on either side, and no third-p
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20%7C%20Linux-lightgrey.svg)](#requirements)
 [![Python](https://img.shields.io/badge/python-3.13%20bundled-informational.svg)](#zero-install)
-[![Version](https://img.shields.io/badge/version-1.3.0-success.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.4.0-success.svg)](CHANGELOG.md)
 
 </div>
 
@@ -90,7 +90,16 @@ system-wide.
 
 ## Quick start
 
-**1. Windows — double-click `win\start-gui.cmd`**
+Download `WinLinuxBridge-1.4.0.zip` from
+[GitHub Releases](https://github.com/Fatmear/WinLinuxBridge/releases/latest) and extract the
+complete archive, not just the source-code archive or individual scripts. On Linux, keep
+the delivery directory at `~/WinLinuxBridge` under the SSH user's home, not `/root`.
+The Windows installer can upload and create it automatically; no root access is needed.
+
+**1. Windows — double-click `win\start-gui.vbs`**
+
+This is the default windowless entry point. Legacy `.cmd` launchers remain for manual
+diagnostics and may briefly display a console when double-clicked.
 
 Fill in the Linux address, account and password, then press **Install and start**
 (安装并启动). The first run shows the server host-key fingerprint for confirmation, then

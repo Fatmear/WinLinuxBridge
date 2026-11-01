@@ -61,6 +61,7 @@ if ($stale.Count -gt 0) {
     Start-Sleep -Milliseconds 700
 }
 $lastAgentStart = Get-Date
+$backgroundProcesses = New-Object 'Collections.Generic.List[object]'
 
 function Start-Agent {
     if (-not $py) {
@@ -72,13 +73,13 @@ function Start-Agent {
         Write-WbLog ('agent: missing ' + $agentPy)
         return
     }
-    $argStr = (@($py.Args) + @('"' + $agentPy + '"')) -join ' '
     $env:WL_AGENT_PORT = [string]$agentPort
     $env:WL_BRIDGE_DIR = $localRoot
     try {
-        Start-Process -FilePath $py.Exe -ArgumentList $argStr -WindowStyle Hidden `
-            -RedirectStandardError (Join-Path $appDir 'logs\agent-stderr.log') `
-            -RedirectStandardOutput (Join-Path $appDir 'logs\agent-stdout.log') | Out-Null
+        $child = Start-WbBackgroundProcess -FilePath $py.Exe -Arguments (@($py.Args) + @($agentPy)) `
+            -StderrPath (Join-Path $appDir 'logs\agent-stderr.log') `
+            -StdoutPath (Join-Path $appDir 'logs\agent-stdout.log')
+        $backgroundProcesses.Add($child)
         Write-WbLog 'agent: started'
         $script:lastAgentStart = Get-Date
     } catch {
@@ -101,7 +102,7 @@ function Start-Tunnel {
     $forward = '127.0.0.1:{0}:127.0.0.1:{1}' -f $tunnelPort, $agentPort
     $tunnelArgs = @(
         '-N', '-T',
-        '-i', ('"' + $sshKey + '"'),
+        '-i', $sshKey,
         '-o', 'BatchMode=yes',
         '-o', 'ExitOnForwardFailure=yes',
         '-o', 'StrictHostKeyChecking=accept-new',
@@ -114,8 +115,9 @@ function Start-Tunnel {
         $target
     )
     try {
-        Start-Process -FilePath $ssh -ArgumentList $tunnelArgs -WindowStyle Hidden `
-            -RedirectStandardError (Join-Path $appDir 'logs\tunnel.log') | Out-Null
+        $child = Start-WbBackgroundProcess -FilePath $ssh -Arguments $tunnelArgs `
+            -StderrPath (Join-Path $appDir 'logs\tunnel.log')
+        $backgroundProcesses.Add($child)
         Write-WbLog ('tunnel: started (-R ' + $forward + ')')
     } catch {
         Write-WbLog ('tunnel: start failed: ' + $_.Exception.Message)
@@ -138,6 +140,16 @@ $firstProgram = $true
 
 while ($true) {
     try {
+        for ($index = $backgroundProcesses.Count - 1; $index -ge 0; $index--) {
+            $child = $backgroundProcesses[$index]
+            if (-not $child.Process.HasExited) { continue }
+            if ($child.StdoutTask -and -not $child.StdoutTask.IsCompleted) { continue }
+            if ($child.StderrTask -and -not $child.StderrTask.IsCompleted) { continue }
+            if ($child.StdoutStream) { $child.StdoutStream.Dispose() }
+            if ($child.StderrStream) { $child.StderrStream.Dispose() }
+            $child.Process.Dispose()
+            $backgroundProcesses.RemoveAt($index)
+        }
         if (-not (Test-WbAgent -Conf $conf)) {
             # Only one path leads to a restart: either nothing is running, or a
             # process holds the port but never answers (stale token) for 30s.

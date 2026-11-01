@@ -5,7 +5,7 @@ entries always use forward slashes, which Compress-Archive on Windows does not
 guarantee.
 
     python tools/package_release.py                # version from VERSION
-    python tools/package_release.py --version 1.3.0 --out release
+    python tools/package_release.py --version 1.4.0 --out release
 
 Refuses to build when a shippable text file still contains host identity
 (an IPv4 literal, key material) or a secret-shaped value.
@@ -14,6 +14,7 @@ Refuses to build when a shippable text file still contains host identity
 from __future__ import annotations
 
 import argparse
+import ast
 import fnmatch
 import hashlib
 import os
@@ -46,6 +47,7 @@ REQUIRED = [
     "win/winbridge_jobs.py", "win/winbridge_common.ps1",
     "win/winbridge_supervisor.ps1", "win/winbridge_sync.ps1",
     "win/install-win.ps1", "win/start-win.cmd",
+    "win/start-gui.vbs", "win/start-win.vbs",
     "win/runtime/python.exe", "win/runtime/pythonw.exe",
     "win/runtime/python313.zip",
     "win/runtime/_tkinter.pyd", "win/runtime/tcl/tcl8.6/init.tcl",
@@ -59,7 +61,7 @@ REQUIRED = [
 ]
 
 # Text files that must never carry identity or secrets.
-SCAN_EXTENSIONS = (".md", ".ps1", ".py", ".sh", ".cmd", ".conf", ".example",
+SCAN_EXTENSIONS = (".md", ".ps1", ".py", ".pyw", ".vbs", ".sh", ".cmd", ".conf", ".example",
                    ".txt", ".json", ".yml", ".yaml", "")
 
 ALLOWED_IPV4 = {"127.0.0.1", "0.0.0.0", "255.255.255.0", "192.0.2.1"}
@@ -113,6 +115,15 @@ def scan(base: str) -> list:
                 value = match.group(0).strip()
                 if label == "ipv4" and value in ALLOWED_IPV4:
                     continue
+                if label == "password-value" and relative.endswith((".py", ".pyw")):
+                    candidate = re.split(r"[=:]", value, maxsplit=1)[-1].strip().rstrip("),:")
+                    try:
+                        expression = ast.parse(candidate, mode="eval").body
+                    except SyntaxError:
+                        expression = None
+                    if isinstance(expression, ast.Name) or isinstance(expression, ast.Constant) and (
+                            isinstance(expression.value, bool) or expression.value is None):
+                        continue
                 problems.append("%s: [%s] %s" % (relative, label, value[:80]))
     return problems
 

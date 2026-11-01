@@ -19,7 +19,8 @@ Linux wl ──► 127.0.0.1:18080 ══ SSH 隧道（Windows 发起）══�
 
 | 文件 | 作用 |
 | --- | --- |
-| `win\start-gui.cmd` | **双击入口**。无 Python 也能跑 |
+| `win\start-gui.vbs` | **默认双击入口**。直接启动便携 Pythonw，不打开 CMD |
+| `win\start-gui.cmd` | 兼容/手动诊断入口，双击时可能闪出控制台 |
 | `win\WinBridgeGUI.pyw` | 图形界面：配置、部署、启停、状态、日志 |
 | `win\runtime\` | 便携 CPython 3.13 + Tcl/Tk（含 tkinter） |
 | `win\vendor\plink.exe` | 首次密码登录装公钥（PuTTY 0.77, MIT） |
@@ -52,7 +53,8 @@ Linux wl ──► 127.0.0.1:18080 ══ SSH 隧道（Windows 发起）══�
 | `win/winbridge_sync.ps1` | 三车道 + 程序文件刷新（只用 `scp`） |
 | `win/winbridge_common.ps1` | 配置/进程/日志/API 公共函数 |
 | `win/install-win.ps1` | 一次性安装（密钥、上传、令牌、自启） |
-| `win/start-win.cmd` | 入口：`start-win.cmd` 后台 / `start-win.cmd console` 前台 |
+| `win/start-win.vbs` | 静默后台入口，登录自启和看门狗不调用 CMD |
+| `win/start-win.cmd` | 兼容诊断入口：`start-win.cmd console` 前台 |
 | `linux/wl` | Linux 命令行 |
 | `linux/install-linux.sh` | Linux 目录与权限初始化 |
 | `tools/verify.ps1` / `tools/verify.sh` | 两端自检 |
@@ -62,7 +64,7 @@ Linux wl ──► 127.0.0.1:18080 ══ SSH 隧道（Windows 发起）══�
 
 | 需要什么 | 从哪来 | 缺失时 |
 | --- | --- | --- |
-| Python 3.13 + tkinter | `win\runtime\`（随包） | `start-gui.cmd` 回退系统 Python；再没有就提示重建 |
+| Python 3.13 + tkinter | `win\runtime\`（随包） | 默认 VBS 入口提示完整解压发布包 |
 | 密码登录 SSH | `win\vendor\plink.exe`（随包） | 提示需要 plink，或改用免密方式 |
 | `ssh.exe` / `scp.exe` | Windows 10/11 自带 OpenSSH | 提示启用「可选功能 → OpenSSH 客户端」 |
 | PowerShell | Windows 自带 | 不支持（必装组件） |
@@ -108,7 +110,7 @@ powershell -ExecutionPolicy Bypass -File tools\build-runtime.ps1
 ### Windows（图形界面）
 
 ```
-双击 win\start-gui.cmd            打开控制面板（无控制台窗口）
+双击 win\start-gui.vbs            打开控制面板（无 CMD 窗口）
 win\start-gui.cmd console         同前，但保留控制台便于看诊断信息
 ```
 
@@ -117,7 +119,7 @@ win\start-gui.cmd console         同前，但保留控制台便于看诊断信�
 ```
 install-win.ps1            一次性安装（-NonInteractive 供界面调用）
 install-win.ps1 -SkipKeys  只刷新程序与配置，不动密钥与令牌
-start-win.cmd              后台启动（守护代理 + 隧道 + 同步）
+start-win.vbs              静默后台启动（守护代理 + 隧道 + 同步）
 start-win.cmd console      前台启动，看实时日志
 winbridge_sync.ps1 -Mode program|lanes|fromwin|towin|shared|all
 tools\verify.ps1           自检（不需要隧道）
@@ -161,7 +163,7 @@ wl doctor [--json]              # 版本/shell/超时/路径/任务统计
 ### Windows（图形界面）
 
 ```
-双击 win\start-gui.cmd            打开控制面板（无控制台窗口）
+双击 win\start-gui.vbs            打开控制面板（无 CMD 窗口）
 win\start-gui.cmd console         同前，但保留控制台便于看诊断信息
 ```
 
@@ -170,7 +172,7 @@ win\start-gui.cmd console         同前，但保留控制台便于看诊断信�
 ```
 install-win.ps1            一次性安装（-NonInteractive 供界面调用）
 install-win.ps1 -SkipKeys  只刷新程序与配置，不动密钥与令牌
-start-win.cmd              后台启动（守护代理 + 隧道 + 同步）
+start-win.vbs              静默后台启动（守护代理 + 隧道 + 同步）
 start-win.cmd console      前台启动，看实时日志
 winbridge_sync.ps1 -Mode program|lanes|fromwin|towin|shared|all
 tools\verify.ps1           自检（不需要隧道）

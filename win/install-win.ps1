@@ -83,8 +83,8 @@ foreach ($spec in @(
     }
     $dir = Split-Path -Parent $spec.Path
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    $kargs = @('-t', 'ed25519', '-f', ('"' + $spec.Path + '"'), '-N', '""', '-C', $spec.Comment, '-q')
-    Start-Process -FilePath $sshKeygen -ArgumentList $kargs -Wait -NoNewWindow | Out-Null
+    $kargs = @('-t', 'ed25519', '-f', $spec.Path, '-N', '', '-C', $spec.Comment, '-q')
+    $null = Invoke-WbProcess -FilePath $sshKeygen -Arguments $kargs
     if (-not (Test-Path -LiteralPath $spec.Path)) { throw ('ssh-keygen failed for ' + $spec.Path) }
     Ok ('created: ' + $spec.Path)
 }
@@ -141,8 +141,9 @@ echo done
     $tmp = [IO.Path]::GetTempFileName()
     try {
         [IO.File]::WriteAllText($tmp, $script, (New-Object Text.UTF8Encoding($false)))
-        $res = Get-Content -LiteralPath $tmp -Raw | & $plink @plinkArgs 2>&1
-        $rc = $LASTEXITCODE
+        $result = Invoke-WbProcess -FilePath $plink -Arguments $plinkArgs -InputText $script -TimeoutSec 120
+        $res = $result.out
+        $rc = $result.rc
     } finally {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         Remove-Variable pw -ErrorAction SilentlyContinue
@@ -153,7 +154,7 @@ echo done
     }
     ($res | Out-String) -split "`r?`n" | Where-Object { $_ } | ForEach-Object { Ok $_.Trim() }
 
-    $test = & $ssh @((Get-WbSshCommonArgs -Conf $conf) + @($target, 'echo SSHKEY-OK')) 2>&1
+    $test = (Invoke-WbRemote -Conf $conf -Command 'echo SSHKEY-OK').out
     if ((($test | Out-String) -notmatch 'SSHKEY-OK')) {
         throw 'key based login test failed: ' + (($test | Out-String).Trim())
     }
@@ -163,8 +164,8 @@ echo done
 if (-not $SkipUpload) {
     Step ('Uploading the delivery folder to ' + $remoteRoot)
     $remoteCmd = "umask 077; mkdir -p '$remoteRoot/config' '$remoteRoot/shared/from_win' '$remoteRoot/shared/to_win' '$remoteRoot/shared/shared' '$remoteRoot/logs'"
-    $r = & $ssh @((Get-WbSshCommonArgs -Conf $conf) + @($target, $remoteCmd)) 2>&1
-    if ($LASTEXITCODE -ne 0) { throw ('cannot prepare remote root: ' + (($r | Out-String).Trim())) }
+    $r = Invoke-WbRemote -Conf $conf -Command $remoteCmd
+    if ($r.rc -ne 0) { throw ('cannot prepare remote root: ' + $r.out) }
 
     $root = Split-Path -Parent $PSScriptRoot
     # Never ship byte-code caches: they are host specific and useless on Linux.
@@ -177,15 +178,15 @@ if (-not $SkipUpload) {
             continue
         }
         $scpArgs = @('-r', '-p') + (Get-WbScpCommonArgs -Conf $conf) + @($src, ($target + ':' + $remoteRoot + '/'))
-        & $scp @scpArgs | Out-Null
-        if ($LASTEXITCODE -ne 0) { Warn ('upload failed: ' + $item) } else { Ok ('uploaded ' + $item) }
+        $result = Invoke-WbProcess -FilePath $scp -Arguments $scpArgs -TimeoutSec 300
+        if ($result.rc -ne 0) { Warn ('upload failed: ' + $item) } else { Ok ('uploaded ' + $item) }
     }
     foreach ($item in @('README.md', 'VERSION')) {
         $src = Join-Path $root $item
         if (-not (Test-Path -LiteralPath $src)) { continue }
         $scpArgs = @('-p') + (Get-WbScpCommonArgs -Conf $conf) + @($src, ($target + ':' + $remoteRoot + '/'))
-        & $scp @scpArgs | Out-Null
-        if ($LASTEXITCODE -ne 0) { Warn ('upload failed: ' + $item) }
+        $result = Invoke-WbProcess -FilePath $scp -Arguments $scpArgs -TimeoutSec 300
+        if ($result.rc -ne 0) { Warn ('upload failed: ' + $item) }
     }
     $remoteInstall = "tr -d '\r' < " + $remoteRoot + '/linux/install-linux.sh > ' + $remoteRoot + '/linux/install-linux.sh.tmp' +
                      ' && mv ' + $remoteRoot + '/linux/install-linux.sh.tmp ' + $remoteRoot + '/linux/install-linux.sh' +
@@ -220,8 +221,8 @@ $envTmp = [IO.Path]::GetTempFileName()
 try {
     [IO.File]::WriteAllText($envTmp, $envText.Replace("`r`n", "`n"), (New-Object Text.UTF8Encoding($false)))
     $scpArgs = @('-p') + (Get-WbScpCommonArgs -Conf $conf) + @($envTmp, ($target + ':' + $remoteRoot + '/config/bridge.env'))
-    & $scp @scpArgs | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'failed to upload the Linux side env file' }
+    $result = Invoke-WbProcess -FilePath $scp -Arguments $scpArgs -TimeoutSec 300
+    if ($result.rc -ne 0) { throw 'failed to upload the Linux side env file' }
 } finally {
     Remove-Item -LiteralPath $envTmp -Force -ErrorAction SilentlyContinue
 }
@@ -240,7 +241,7 @@ foreach ($d in @($localRoot, (Join-Path $localRoot 'shared\from_win'),
 
 Step 'Registering autostart (current user only)'
 $startupDir = [Environment]::GetFolderPath('Startup')
-$startupCmd = Join-Path $startupDir 'WinLinuxBridge.cmd'
+$startupCmd = Join-Path $startupDir 'WinLinuxBridge.vbs'
 
 # Writes the Startup entry for a supervisor script that is known to exist.
 function Register-WbAutostart {
@@ -248,9 +249,11 @@ function Register-WbAutostart {
     # One physical line, and the path is scrubbed of any stray CR/LF first:
     # a line break inside the quotes silently breaks autostart.
     $clean = ($SupervisorPath -replace "[\r\n]", "").Trim().Trim('"')
-    $line = 'start "" /min powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $clean + '"'
-    $body = '@echo off' + "`r`n" + 'rem WinLinuxBridge autostart (created by install-win.ps1)' + "`r`n" + $line + "`r`n"
-    [IO.File]::WriteAllText($startupCmd, $body, (New-Object Text.ASCIIEncoding))
+    $line = 'CreateObject("WScript.Shell").Run "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""' + $clean.Replace('"', '""') + '""", 0, False'
+    $body = 'Option Explicit' + "`r`n" + $line + "`r`n"
+    [IO.File]::WriteAllText($startupCmd, $body, (New-Object Text.UnicodeEncoding($false, $true)))
+    $legacy = Join-Path $startupDir 'WinLinuxBridge.cmd'
+    if (Test-Path -LiteralPath $legacy) { Remove-Item -LiteralPath $legacy -Force }
     return $startupCmd
 }
 
@@ -288,7 +291,8 @@ if (-not $NoStart) {
 
     Step 'Refreshing the local mirror and starting the bridge'
     $sync = Join-Path $PSScriptRoot 'winbridge_sync.ps1'
-    & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $sync -Mode program | Out-Null
+    $result = Invoke-WbProcess -FilePath 'powershell.exe' -Arguments @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $sync, '-Mode', 'program') -TimeoutSec 1200
+    if ($result.rc -ne 0) { throw ('mirror refresh failed: ' + $result.out) }
 
     # The mirror must contain the supervisor, otherwise autostart and start-win
     # point at nothing. Fall back to the folder this installer runs from.
@@ -314,10 +318,11 @@ if (-not $NoStart) {
     }
 
     Write-WbLog 'install: starting supervisor' 'install'
-    Start-Process -FilePath 'powershell.exe' -ArgumentList @(
+    $child = Start-WbBackgroundProcess -FilePath 'powershell.exe' -Arguments @(
         '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-        '-WindowStyle', 'Hidden', '-File', ('"' + $supervisor + '"')
-    ) -WindowStyle Hidden | Out-Null
+        '-WindowStyle', 'Hidden', '-File', $supervisor
+    )
+    $child.Process.Dispose()
     Start-Sleep -Seconds 8
 
     $okAgent = Test-WbAgent -Conf $conf

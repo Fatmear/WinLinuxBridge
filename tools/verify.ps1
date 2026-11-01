@@ -153,6 +153,86 @@ Check 'vendor binaries and licences present' {
     'plink.exe + 2 licences'
 }
 
+Check 'native subprocess has no console and preserves arguments' {
+    $exe = Join-Path $root 'win\runtime\python.exe'
+    $code = 'import ctypes,sys; assert ctypes.windll.kernel32.GetConsoleWindow()==0; assert sys.argv[1:]==["space value",chr(34),"C:"+chr(92)]; print("NO_CONSOLE"); print("ERROR_CAPTURE",file=sys.stderr); sys.exit(7)'
+    $result = Invoke-WbProcess -FilePath $exe -Arguments @('-B', '-c', $code, 'space value', '"', 'C:\')
+    if ($result.rc -ne 7 -or $result.out -notmatch 'NO_CONSOLE' -or $result.out -notmatch 'ERROR_CAPTURE') {
+        throw ('console/arguments/output/exit-code check failed: ' + $result.out)
+    }
+    'GetConsoleWindow=0, arguments/stdout/stderr/exit code intact'
+}
+
+Check 'background subprocess has no console and writes live logs' {
+    function Read-SharedLog {
+        param([string]$Path)
+        $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        $reader = [IO.StreamReader]::new($stream)
+        try { return $reader.ReadToEnd().Trim() } finally { $reader.Dispose() }
+    }
+    $directory = Join-Path ([IO.Path]::GetTempPath()) ('wl-hidden-' + [guid]::NewGuid().ToString('N'))
+    $null = [IO.Directory]::CreateDirectory($directory)
+    $signalName = 'Local\WlbHidden-' + [guid]::NewGuid().ToString('N')
+    $signal = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, $signalName)
+    $watcher = [IO.FileSystemWatcher]::new($directory, 'out.log')
+    $watcher.NotifyFilter = [IO.NotifyFilters]::LastWrite -bor [IO.NotifyFilters]::Size
+    $eventName = 'WlbLiveLog-' + [guid]::NewGuid().ToString('N')
+    $null = Register-ObjectEvent -InputObject $watcher -EventName Changed -SourceIdentifier $eventName
+    $watcher.EnableRaisingEvents = $true
+    $child = $null
+    try {
+        $code = 'import ctypes,sys; kernel=ctypes.WinDLL("kernel32",use_last_error=True); kernel.OpenEventW.restype=ctypes.c_void_p; kernel.WaitForSingleObject.argtypes=[ctypes.c_void_p,ctypes.c_ulong]; handle=kernel.OpenEventW(0x100000,False,sys.argv[1]); print(kernel.GetConsoleWindow(),flush=True); print("ERROR_CAPTURE",file=sys.stderr,flush=True); kernel.WaitForSingleObject(handle,10000)'
+        $child = Start-WbBackgroundProcess -FilePath (Join-Path $root 'win\runtime\python.exe') `
+            -Arguments @('-B', '-c', $code, $signalName) `
+            -StdoutPath (Join-Path $directory 'out.log') -StderrPath (Join-Path $directory 'err.log')
+        $deadline = [DateTime]::UtcNow.AddSeconds(5)
+        $out = ''
+        while ($out -ne '0' -and [DateTime]::UtcNow -lt $deadline) {
+            $notification = Wait-Event -SourceIdentifier $eventName -Timeout 1
+            if (-not $notification) { continue }
+            Remove-Event -EventIdentifier $notification.EventIdentifier
+            $out = Read-SharedLog -Path (Join-Path $directory 'out.log')
+        }
+        if ($out -ne '0' -or $child.Process.HasExited) { throw 'console exists or logs only arrive after process exit' }
+        $null = $signal.Set()
+        if (-not $child.Process.WaitForExit(5000)) { throw 'background process did not finish' }
+        $null = $child.StdoutTask.GetAwaiter().GetResult()
+        $null = $child.StderrTask.GetAwaiter().GetResult()
+        if ($child.Process.ExitCode -ne 0 -or (Read-SharedLog -Path (Join-Path $directory 'err.log')) -ne 'ERROR_CAPTURE') {
+            throw 'background exit/error log check failed'
+        }
+        'GetConsoleWindow=0, log received before exit through a filesystem event'
+    } finally {
+        $null = $signal.Set()
+        if ($child) {
+            if (-not $child.Process.WaitForExit(5000)) {
+                try { $child.Process.Kill() } catch { if (-not $child.Process.HasExited) { throw } }
+                $child.Process.WaitForExit()
+            }
+            if ($child.StdoutTask) { $null = $child.StdoutTask.GetAwaiter().GetResult() }
+            if ($child.StderrTask) { $null = $child.StderrTask.GetAwaiter().GetResult() }
+            if ($child.StdoutStream) { $child.StdoutStream.Dispose() }
+            if ($child.StderrStream) { $child.StderrStream.Dispose() }
+            $child.Process.Dispose()
+        }
+        Unregister-Event -SourceIdentifier $eventName
+        Remove-Event -SourceIdentifier $eventName -ErrorAction SilentlyContinue
+        $watcher.Dispose()
+        $signal.Dispose()
+        [IO.Directory]::Delete($directory, $true)
+    }
+}
+
+Check 'windowless launchers ship and watchdog avoids cmd' {
+    foreach ($relative in @('win\start-gui.vbs', 'win\start-win.vbs')) {
+        $body = [IO.File]::ReadAllText((Join-Path $root $relative))
+        if ($body -notmatch ', 0, False' -or $body -match 'cmd\.exe') { throw ('not windowless: ' + $relative) }
+    }
+    $common = [IO.File]::ReadAllText((Join-Path $root 'win\winbridge_common.ps1'))
+    if ($common -notmatch 'wscript\.exe //B //Nologo') { throw 'watchdog has no windowless entry' }
+    'GUI/daemon VBS launchers and wscript watchdog present'
+}
+
 Check 'GUI headless selftest' {
     $exe = Join-Path $root 'win\runtime\python.exe'
     if (-not (Test-Path -LiteralPath $exe)) { $exe = (Get-WbPython).Exe }
@@ -198,13 +278,16 @@ Check 'PowerShell scripts are UTF-8 with BOM' {
 }
 
 Check 'autostart entry points at an existing single-line path' {
-    $startup = Join-Path ([Environment]::GetFolderPath('Startup')) 'WinLinuxBridge.cmd'
+    $startup = Join-Path ([Environment]::GetFolderPath('Startup')) 'WinLinuxBridge.vbs'
+    if (-not (Test-Path -LiteralPath $startup)) {
+        $startup = [IO.Path]::ChangeExtension($startup, '.cmd')
+    }
     if (-not (Test-Path -LiteralPath $startup)) { throw 'no Startup entry (run install-win.ps1 or use the GUI checkbox)' }
     $raw = [IO.File]::ReadAllText($startup)
     $lines = @($raw -split "`r?`n" | Where-Object { $_.Trim() })
     $hit = @($lines | Where-Object { $_ -match '-File\s+"' })
     if ($hit.Count -ne 1) { throw ('expected exactly 1 command line, found ' + $hit.Count) }
-    $m = [regex]::Match($hit[0], '-File\s+"([^"]+)"')
+    $m = [regex]::Match($hit[0], '-File\s+"{1,2}([^"]+)"')
     if (-not $m.Success) { throw 'the -File argument is not quoted on one line' }
     $target = $m.Groups[1].Value
     if (-not (Test-Path -LiteralPath $target)) { throw ('autostart points at a missing file: ' + $target) }

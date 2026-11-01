@@ -93,7 +93,7 @@ function Set-WbTokenFile {
     $path = Join-Path $appDir 'agent.token'
     [IO.File]::WriteAllText($path, $Token, (New-Object Text.UTF8Encoding($false)))
     # Restrict to the current user only.
-    & icacls.exe $path /inheritance:r /grant:r ("{0}:(F)" -f $env:USERNAME) | Out-Null
+    $null = Invoke-WbProcess -FilePath 'icacls.exe' -Arguments @($path, '/inheritance:r', '/grant:r', ("{0}:(F)" -f $env:USERNAME))
     return $path
 }
 
@@ -115,9 +115,13 @@ function Write-WbLog {
 # install-win.ps1 so the same helper is available to every entry point.
 function Register-WbWatchdog {
     param([string]$StartCmdPath)
-    if (-not (Test-Path -LiteralPath $StartCmdPath)) { return $false }
-    $null = & schtasks.exe /Create /F /SC MINUTE /MO 5 /TN 'WinLinuxBridge-Watchdog' /TR ('"' + $StartCmdPath + '"') 2>&1
-    return ($LASTEXITCODE -eq 0)
+    $launcher = Join-Path (Split-Path -Parent $StartCmdPath) 'start-win.vbs'
+    if (-not (Test-Path -LiteralPath $launcher)) { return $false }
+    $command = 'wscript.exe //B //Nologo "' + $launcher + '"'
+    $result = Invoke-WbProcess -FilePath 'schtasks.exe' -Arguments @(
+        '/Create', '/F', '/SC', 'MINUTE', '/MO', '5', '/TN', 'WinLinuxBridge-Watchdog', '/TR', $command
+    )
+    return ($result.rc -eq 0)
 }
 
 function Get-WbPython {
@@ -134,8 +138,8 @@ function Get-WbPython {
         $cmd = Get-Command $c.Exe -ErrorAction SilentlyContinue
         if (-not $cmd) { continue }
         try {
-            & $c.Exe @($c.Args + @('-c', 'import sys')) 2>$null | Out-Null
-            if ($LASTEXITCODE -eq 0) { return @{ Exe = $c.Exe; Args = $c.Args; Bundled = $false } }
+            $result = Invoke-WbProcess -FilePath $c.Exe -Arguments @($c.Args + @('-c', 'import sys'))
+            if ($result.rc -eq 0) { return @{ Exe = $c.Exe; Args = $c.Args; Bundled = $false } }
         } catch { }
     }
     return $null
@@ -174,7 +178,7 @@ function Get-WbHostKeyFingerprint {
     param([string]$Target, [int]$Port = 22, [string]$Plink)
     if (-not $Plink) { $Plink = Get-WbPlinkExe }
     if (-not $Plink) { return '' }
-    $out = & $Plink -ssh -batch -P $Port $Target 'exit' 2>&1 | Out-String
+    $out = (Invoke-WbProcess -FilePath $Plink -Arguments @('-ssh', '-batch', '-P', [string]$Port, $Target, 'exit')).out
     $m = [regex]::Match($out, 'SHA256:[A-Za-z0-9+/=]+')
     if ($m.Success) { return $m.Value }
     return ''
@@ -185,7 +189,7 @@ function Test-WbHostKeyCached {
     param([string]$Target, [int]$Port = 22, [string]$Plink)
     if (-not $Plink) { $Plink = Get-WbPlinkExe }
     if (-not $Plink) { return $false }
-    $out = & $Plink -ssh -batch -P $Port $Target 'exit' 2>&1 | Out-String
+    $out = (Invoke-WbProcess -FilePath $Plink -Arguments @('-ssh', '-batch', '-P', [string]$Port, $Target, 'exit')).out
     return ($out -notmatch 'not cached' -and $out -notmatch 'Cannot confirm a host key')
 }
 
@@ -226,13 +230,85 @@ function Get-WbTarget {
     return ('{0}@{1}' -f $Conf['WL_LINUX_USER'], $Conf['WL_LINUX_HOST'])
 }
 
+function ConvertTo-WbProcessArguments {
+    param([string[]]$Arguments)
+    return (($Arguments | ForEach-Object {
+        '"' + [regex]::Replace([regex]::Replace($_, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
+    }) -join ' ')
+}
+
+function Invoke-WbProcess {
+    param([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSec = 60, [string]$InputText)
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $FilePath
+    $info.Arguments = ConvertTo-WbProcessArguments -Arguments $Arguments
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.RedirectStandardInput = $PSBoundParameters.ContainsKey('InputText')
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $info
+    try {
+        $null = $process.Start()
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if ($info.RedirectStandardInput) {
+            $process.StandardInput.Write($InputText)
+            $process.StandardInput.Close()
+        }
+        if (-not $process.WaitForExit($TimeoutSec * 1000)) {
+            $process.Kill()
+            $process.WaitForExit()
+            throw ('process timed out after {0}s: {1}' -f $TimeoutSec, $FilePath)
+        }
+        return @{ rc = $process.ExitCode; out = ($stdout.Result + $stderr.Result).Trim() }
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Start-WbBackgroundProcess {
+    param([string]$FilePath, [string[]]$Arguments, [string]$StdoutPath, [string]$StderrPath)
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $FilePath
+    $info.Arguments = ConvertTo-WbProcessArguments -Arguments $Arguments
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = [bool]$StdoutPath
+    $info.RedirectStandardError = [bool]$StderrPath
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $info
+    try {
+        if ($StdoutPath) {
+            $stream = [IO.FileStream]::new($StdoutPath, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1, $true)
+        }
+        if ($StderrPath) {
+            $errorStream = [IO.FileStream]::new($StderrPath, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1, $true)
+        }
+        $null = $process.Start()
+        if ($StdoutPath) {
+            $stdoutTask = $process.StandardOutput.BaseStream.CopyToAsync($stream)
+        }
+        if ($StderrPath) {
+            $stderrTask = $process.StandardError.BaseStream.CopyToAsync($errorStream)
+        }
+        return @{ Process = $process; StdoutTask = $stdoutTask; StderrTask = $stderrTask;
+                  StdoutStream = $stream; StderrStream = $errorStream }
+    } catch {
+        if ($stream) { $stream.Dispose() }
+        if ($errorStream) { $errorStream.Dispose() }
+        $process.Dispose()
+        throw
+    }
+}
+
 function Invoke-WbRemote {
     param($Conf, [string]$Command, [int]$TimeoutSec = 60)
     $ssh = Get-WbSshExe
     if (-not $ssh) { throw 'ssh.exe not found' }
     $sshArgs = (Get-WbSshCommonArgs -Conf $Conf) + @((Get-WbTarget -Conf $Conf), $Command)
-    $out = & $ssh @sshArgs 2>&1
-    return @{ rc = $LASTEXITCODE; out = ($out | Out-String).Trim() }
+    return Invoke-WbProcess -FilePath $ssh -Arguments $sshArgs -TimeoutSec $TimeoutSec
 }
 
 function Invoke-WbApi {

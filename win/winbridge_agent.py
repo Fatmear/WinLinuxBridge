@@ -47,7 +47,7 @@ from logging.handlers import RotatingFileHandler
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import winbridge_jobs as jobs  # noqa: E402
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("WL_AGENT_PORT") or 8787)
 

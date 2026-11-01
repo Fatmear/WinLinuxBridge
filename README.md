@@ -12,7 +12,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20%7C%20Linux-lightgrey.svg)](#环境要求)
 [![Python](https://img.shields.io/badge/python-3.13%20内置-informational.svg)](#开箱即用)
-[![Version](https://img.shields.io/badge/version-1.3.0-success.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.4.0-success.svg)](CHANGELOG.md)
 
 </div>
 
@@ -85,7 +85,14 @@ Linux 只要访问本机 `127.0.0.1` 就能抵达跑在 Windows 上的控制代�
 
 ## 快速开始
 
-**1. Windows：双击 `win\start-gui.cmd`**
+从 [GitHub Releases](https://github.com/Fatmear/WinLinuxBridge/releases/latest) 下载
+`WinLinuxBridge-1.4.0.zip`，完整解压，不能只取源代码压缩包或单独复制脚本。
+Linux 端的交付目录放在 SSH 登录用户的家目录 `~/WinLinuxBridge` 即可；这不是系统
+`/root` 目录，不需要 root。Windows 图形安装器也可自动上传并创建该目录。
+
+**1. Windows：双击 `win\start-gui.vbs`**
+
+这是无命令行窗口的默认入口。旧 `.cmd` 入口仅保留作手动诊断，双击它仍可能闪出窗口。
 
 填写 Linux 地址、账号、密码，点「安装并启动」。首次会先显示服务器主机指纹让你确认，
 随后自动完成：生成密钥 → 装公钥 → 上传程序 → 配置令牌 → 注册自启 → 启动。

@@ -49,8 +49,9 @@ function New-WbDir {
 function Invoke-Scp {
     param([string]$Source, [string]$Dest, [string]$Label)
     $scpArgs = @('-r', '-p') + $scpArgs0 + @($Source, $Dest)
-    $out = & $scp @scpArgs 2>&1
-    $rc = $LASTEXITCODE
+    $result = Invoke-WbProcess -FilePath $scp -Arguments $scpArgs -TimeoutSec 300
+    $out = $result.out
+    $rc = $result.rc
     if ($rc -ne 0) {
         Write-WbLog ('sync/{0}: rc={1} {2}' -f $Label, $rc, (($out | Out-String).Trim())) 'sync'
     }
@@ -66,8 +67,9 @@ function Invoke-ScpFile {
     $parent = Split-Path -Parent $Dest
     if ($parent) { New-WbDir $parent }
     $scpArgs = @('-p') + $scpArgs0 + @($Source, $Dest)
-    $out = & $scp @scpArgs 2>&1
-    $rc = $LASTEXITCODE
+    $result = Invoke-WbProcess -FilePath $scp -Arguments $scpArgs -TimeoutSec 300
+    $out = $result.out
+    $rc = $result.rc
     if ($rc -ne 0) { Write-WbLog ('sync/{0}: rc={1} {2}' -f $Label, $rc, (($out | Out-String).Trim())) 'sync' }
     return $rc
 }
@@ -119,6 +121,7 @@ function Sync-Program {
     $files = @(
         'VERSION', 'README.md',
         'win\WinBridgeGUI.pyw', 'win\start-gui.cmd', 'win\start-win.cmd',
+        'win\start-gui.vbs', 'win\start-win.vbs',
         'win\winbridge_agent.py', 'win\winbridge_jobs.py', 'win\winbridge_common.ps1',
         'win\winbridge_supervisor.ps1', 'win\winbridge_sync.ps1',
         'win\install-win.ps1', 'win\bridge.conf.example',
