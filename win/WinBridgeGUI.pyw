@@ -19,12 +19,14 @@ import base64
 import ctypes
 import ctypes.wintypes as wt
 import json
+import msvcrt
 import os
 import queue
 import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -336,36 +338,84 @@ def run_ps_stream(script: str, args=None, on_line=None, timeout: int = 1800,
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, env=full_env, cwd=SCRIPT_DIR,
-            creationflags=_creationflags(),
+            creationflags=_creationflags(), bufsize=0,
         )
     except Exception as exc:
         say("无法运行 PowerShell: %s" % exc)
         return -1
 
-    expired = threading.Event()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenThread.argtypes = (wt.DWORD, wt.BOOL, wt.DWORD)
+    kernel32.OpenThread.restype = wt.HANDLE
+    kernel32.CancelSynchronousIo.argtypes = (wt.HANDLE,)
+    kernel32.CloseHandle.argtypes = (wt.HANDLE,)
+    kernel32.PeekNamedPipe.argtypes = (
+        wt.HANDLE, wt.LPVOID, wt.DWORD, wt.LPVOID,
+        ctypes.POINTER(wt.DWORD), wt.LPVOID)
+    pipe_handle = msvcrt.get_osfhandle(proc.stdout.fileno())
+    stopped = threading.Event()
+    errors = []
 
-    def killer():
-        expired.set()
+    def read_output():
+        pending = b""
+
+        def consume(raw):
+            nonlocal pending
+            pending += raw
+            lines = pending.split(b"\n")
+            pending = lines.pop()
+            for line in lines:
+                say(decode(line).rstrip("\r"))
+
         try:
-            proc.kill()
-        except Exception:
-            pass
+            while not stopped.is_set():
+                raw = proc.stdout.read(8192)
+                if not raw:
+                    break
+                consume(raw)
+        except OSError as exc:
+            if not stopped.is_set():
+                errors.append(str(exc))
+        finally:
+            try:
+                available = wt.DWORD()
+                if kernel32.PeekNamedPipe(
+                    pipe_handle, None, 0, None,
+                    ctypes.byref(available), None):
+                    if available.value:
+                        consume(proc.stdout.read(available.value))
+                if pending:
+                    say(decode(pending).rstrip("\r"))
+            finally:
+                proc.stdout.close()
 
-    guard = threading.Timer(timeout, killer)
-    guard.daemon = True
-    guard.start()
+    reader = threading.Thread(target=read_output, name="ps-output",
+                              daemon=True)
+    reader.start()
     try:
-        for raw in iter(proc.stdout.readline, b""):
-            say(decode(raw).rstrip("\r\n"))
-        rc = proc.wait()
-    finally:
-        guard.cancel()
         try:
-            proc.stdout.close()
-        except Exception:
-            pass
-    if expired.is_set():
-        say("命令超时（%ss），已终止" % timeout)
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+            say("命令超时（%ss），已终止" % timeout)
+            rc = -1
+    finally:
+        reader.join(timeout=0.25)
+        if reader.is_alive():
+            stopped.set()
+            handle = kernel32.OpenThread(0x0001, False, reader.native_id)
+            if handle:
+                try:
+                    kernel32.CancelSynchronousIo(handle)
+                finally:
+                    kernel32.CloseHandle(handle)
+            reader.join(timeout=3)
+    if reader.is_alive():
+        say("日志读取线程未能退出，请查看诊断日志")
+        return -1
+    if errors:
+        say("日志读取失败：%s" % errors[0])
         return -1
     return rc
 
@@ -441,7 +491,7 @@ def probe_host_key(host: str, user: str, port: int) -> str:
 #
 # The daemon runs with no console at all, so its output has to reach this
 # window. Reading the files on a timer would be polling; this blocks inside
-# ReadDirectoryChangesW and is woken by the file system the moment a log grows.
+# a filesystem notification, waking when logs grow or shutdown is requested.
 # --------------------------------------------------------------------------- #
 class LogFollower(threading.Thread):
     """Streams appended bytes from a set of log files into a callback."""
@@ -452,18 +502,33 @@ class LogFollower(threading.Thread):
         self.names = list(names)
         self.on_line = on_line
         self.max_line = max_line
-        self._stop = threading.Event()
+        self.ready = threading.Event()
+        self._stop_event = threading.Event()
+        self._change_handle = None
+        self._wake_handle = None
+        self._kernel32 = None
         self._offsets = {}
         self._partial = {}
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
+        if self._wake_handle and self._kernel32:
+            self._kernel32.SetEvent(self._wake_handle)
 
     def run(self) -> None:
-        self._prime()
-        while not self._stop.is_set():
-            self._wait_for_change()
+        try:
+            self._prime()
+            while not self._stop_event.is_set():
+                self._wait_for_change()
+                self._drain()
+        finally:
             self._drain()
+            if self._change_handle:
+                self._kernel32.FindCloseChangeNotification(self._change_handle)
+            if self._wake_handle:
+                self._kernel32.CloseHandle(self._wake_handle)
+            self._wake_handle = None
+            self.ready.set()
 
     def _path(self, name: str) -> str:
         return os.path.join(self.directory, name)
@@ -509,45 +574,45 @@ class LogFollower(threading.Thread):
         for line in lines:
             line = line.rstrip("\r")
             if line.strip():
-                self.on_line("[%s] %s" % (label, line[: self.max_line]))
+                self.on_line("[%s] %s" % (label, line[:self.max_line]))
 
     def _wait_for_change(self) -> None:
-        """Blocks until the directory changes; returns on stop or every 2 s."""
-        kernel32 = ctypes.windll.kernel32
-        FILE_LIST_DIRECTORY = 0x0001
-        FILE_SHARE_ALL = 0x00000007
-        OPEN_EXISTING = 3
-        FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
-        handle = kernel32.CreateFileW(
-            self.directory, FILE_LIST_DIRECTORY, FILE_SHARE_ALL, None,
-            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, None,
-        )
-        if handle in (0, -1, ctypes.c_void_p(-1).value):
-            # No notifications available (unusual permission): very slow re-read
-            # so the pane still fills in, never a busy loop.
-            self._stop.wait(1.0)
+        """Waits on filesystem changes or an explicit shutdown event."""
+        if not self._kernel32:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.FindFirstChangeNotificationW.argtypes = (
+                wt.LPCWSTR, wt.BOOL, wt.DWORD)
+            kernel32.FindFirstChangeNotificationW.restype = wt.HANDLE
+            kernel32.CreateEventW.argtypes = (
+                wt.LPVOID, wt.BOOL, wt.BOOL, wt.LPCWSTR)
+            kernel32.CreateEventW.restype = wt.HANDLE
+            kernel32.WaitForMultipleObjects.argtypes = (
+                wt.DWORD, ctypes.POINTER(wt.HANDLE), wt.BOOL, wt.DWORD)
+            kernel32.WaitForMultipleObjects.restype = wt.DWORD
+            for name in ("SetEvent", "CloseHandle",
+                         "FindNextChangeNotification",
+                         "FindCloseChangeNotification"):
+                getattr(kernel32, name).argtypes = (wt.HANDLE,)
+                getattr(kernel32, name).restype = wt.BOOL
+            self._kernel32 = kernel32
+            self._wake_handle = kernel32.CreateEventW(None, True, False, None)
+            handle = kernel32.FindFirstChangeNotificationW(
+                self.directory, False, 0x00000001 | 0x00000008 | 0x00000010)
+            if handle not in (None, 0, ctypes.c_void_p(-1).value):
+                self._change_handle = handle
+            self.ready.set()
+        if not self._wake_handle or not self._change_handle:
+            self._stop_event.wait(1.0)
             return
-        try:
-            buf = ctypes.create_string_buffer(16 * 1024)
-            FILE_NOTIFY_CHANGE_SIZE = 0x00000008
-            FILE_NOTIFY_CHANGE_LAST_WRITE = 0x00000010
-            FILE_NOTIFY_CHANGE_FILE_NAME = 0x00000001
-            flags = (FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE
-                     | FILE_NOTIFY_CHANGE_FILE_NAME)
-            returned = ctypes.c_ulong(0)
-            ok = kernel32.ReadDirectoryChangesW(
-                handle, buf, len(buf), False, flags,
-                ctypes.byref(returned), None, None,
-            )
-            if not ok:
-                self._stop.wait(0.5)
-        except Exception:
-            self._stop.wait(0.5)
-        finally:
-            try:
-                kernel32.CloseHandle(handle)
-            except Exception:
-                pass
+        if self._stop_event.is_set():
+            return
+        handles = (wt.HANDLE * 2)(self._wake_handle, self._change_handle)
+        result = self._kernel32.WaitForMultipleObjects(
+            2, handles, False, 0xFFFFFFFF)
+        if result == 1:
+            self._kernel32.FindNextChangeNotification(self._change_handle)
+        elif result != 0:
+            self._stop_event.wait(1.0)
 
 
 import tkinter as tk
@@ -569,6 +634,7 @@ class WinBridgeApp(tk.Tk):
         self.conf = read_conf()
         self.msgs: "queue.Queue[tuple]" = queue.Queue()
         self.busy = False
+        self._status_pending = False
         self.fingerprint = ""
 
         self.var = {
@@ -813,6 +879,17 @@ class WinBridgeApp(tk.Tk):
                     log_line(text)
                 elif kind == "progress":
                     self._apply_progress(*payload)
+                elif kind == "worker_done":
+                    self._busy(False)
+                    self.after(200, self.refresh_status)
+                elif kind == "status_done":
+                    self._status_pending = False
+                    states, detail = payload
+                    for key, (ok, text) in states.items():
+                        self.status_labels[key].configure(
+                            text=text,
+                            style="Ok.TLabel" if ok else "Bad.TLabel")
+                    self.detail.configure(text=detail)
         except queue.Empty:
             pass
         self.after(150, self._drain)
@@ -901,9 +978,7 @@ class WinBridgeApp(tk.Tk):
             finally:
                 if failed:
                     self.set_progress(None, "已中断")
-                self.msgs.put(("log", ("", "")))
-                self.after(0, lambda: self._busy(False))
-                self.after(200, self.refresh_status)
+                self.msgs.put(("worker_done", None))
 
         threading.Thread(target=runner, daemon=True).start()
 
@@ -944,11 +1019,11 @@ class WinBridgeApp(tk.Tk):
     def on_probe(self) -> None:
         if not self._validate(need_password=False):
             return
+        host = self.var["host"].get().strip()
+        user = self.var["user"].get().strip()
+        port = int(self.var["ssh_port"].get().strip() or "22")
 
         def job():
-            host = self.var["host"].get().strip()
-            user = self.var["user"].get().strip()
-            port = int(self.var["ssh_port"].get().strip() or "22")
             self.emit("正在连接 %s:%d ..." % (host, port))
             try:
                 with socket.create_connection((host, port), timeout=8):
@@ -986,6 +1061,9 @@ class WinBridgeApp(tk.Tk):
         port = int(self.var["ssh_port"].get().strip() or "22")
         remote = self.var["remote"].get().strip()
         local = self.var["local"].get().strip()
+        conf = self.collect_conf()
+        password = self.var["password"].get()
+        remember = self.var["remember"].get()
 
         fp = self.fingerprint or probe_host_key(host, user, port)
         if fp and not messagebox.askyesno(
@@ -1004,10 +1082,10 @@ class WinBridgeApp(tk.Tk):
             args += ["-HostKey", fp]
 
         def job():
-            write_conf(self.collect_conf())
-            if self.var["remember"].get():
-                save_password(self.var["password"].get())
-            env = {"WL_LINUX_PASSWORD": self.var["password"].get()}
+            write_conf(conf)
+            if remember:
+                save_password(password)
+            env = {"WL_LINUX_PASSWORD": password}
             self.emit("开始部署：装密钥 → 上传程序 → 配置令牌 → 注册自启", "cmd")
             self.emit("首次上传包含便携运行时，约 30 MB，请稍候。", "dim")
             rc = run_ps_stream(PS_INSTALL, args, self._install_line,
@@ -1029,12 +1107,13 @@ class WinBridgeApp(tk.Tk):
         host = self.var["host"].get().strip()
         user = self.var["user"].get().strip()
         remote = self.var["remote"].get().strip()
+        conf = self.collect_conf()
         if not os.path.isfile(PS_INSTALL):
             self.emit("找不到 install-win.ps1", "err")
             return
 
         def job():
-            write_conf(self.collect_conf())
+            write_conf(conf)
             self.emit("重新上传程序文件并刷新 Linux 侧脚本（不动密钥与令牌）", "cmd")
             rc = run_ps_stream(
                 PS_INSTALL,
@@ -1080,6 +1159,7 @@ class WinBridgeApp(tk.Tk):
     def on_stop(self) -> None:
         if not messagebox.askyesno("停止", "停止后 Linux 将无法操作这台 Windows。继续吗？"):
             return
+        conf = self.collect_conf()
 
         def job():
             hit = []
@@ -1087,7 +1167,6 @@ class WinBridgeApp(tk.Tk):
             hit += processes_with("winbridge_agent.py")
             hit += processes_with("winbridge_tunnel")
             port = self.var.get("tunnel") if False else None
-            conf = self.collect_conf()
             tunnel_spec = "127.0.0.1:%s:127.0.0.1:%s" % (
                 conf.get("WL_TUNNEL_PORT", "18080"), conf.get("WL_AGENT_PORT", "8787"))
             hit += processes_with(tunnel_spec)
@@ -1108,44 +1187,46 @@ class WinBridgeApp(tk.Tk):
         self._worker("停止", job)
 
     def refresh_status(self) -> None:
+        if self._status_pending:
+            return
         conf = self.collect_conf()
         agent_port = int(conf.get("WL_AGENT_PORT") or 8787)
-
-        def set_state(key, ok, text):
-            lbl = self.status_labels[key]
-            lbl.configure(text=text, style="Ok.TLabel" if ok else "Bad.TLabel")
+        self._status_pending = True
 
         def job():
-            info = None
-            try:
-                info = agent_ping(agent_port, timeout=3)
-            except Exception:
-                info = None
-            set_state("agent", bool(info), "正常" if info else "未响应")
-
-            conf_local = self.collect_conf()
-            tunnel_spec = "127.0.0.1:%s:127.0.0.1:%s" % (
-                conf_local.get("WL_TUNNEL_PORT", "18080"), agent_port)
-            tunnels = processes_with(tunnel_spec)
-            set_state("tunnel", bool(tunnels), "%d 条连接" % len(tunnels) if tunnels else "未建立")
-
-            local = conf_local.get("WL_LOCAL_ROOT", DEFAULTS["WL_LOCAL_ROOT"])
-            shared = os.path.join(local, "shared", "to_win")
-            if os.path.isdir(shared):
-                files = sum(len(f) for _, _, f in os.walk(shared))
-                set_state("sync", True, "%d 个文件" % files)
-            else:
-                set_state("sync", False, "本地目录缺失")
-
+            states = {}
             detail = ""
-            if info:
-                detail = "Windows: %s\\%s   %sx%s   代理 v%s" % (
-                    info.get("host"), info.get("user"),
-                    info.get("screen", {}).get("w"), info.get("screen", {}).get("h"),
-                    info.get("version"))
-            else:
-                detail = "代理未响应：点「启动」，或查看日志目录。"
-            self.after(0, lambda: self.detail.configure(text=detail))
+            try:
+                info = None
+                try:
+                    info = agent_ping(agent_port, timeout=3)
+                except Exception:
+                    pass
+                states["agent"] = (bool(info), "正常" if info else "未响应")
+                tunnel_spec = "127.0.0.1:%s:127.0.0.1:%s" % (
+                    conf.get("WL_TUNNEL_PORT", "18080"), agent_port)
+                tunnels = processes_with(tunnel_spec)
+                states["tunnel"] = (
+                    bool(tunnels),
+                    "%d 条连接" % len(tunnels) if tunnels else "未建立")
+                local = conf.get("WL_LOCAL_ROOT", DEFAULTS["WL_LOCAL_ROOT"])
+                shared = os.path.join(local, "shared", "to_win")
+                if os.path.isdir(shared):
+                    files = sum(len(files) for _, _, files in os.walk(shared))
+                    states["sync"] = (True, "%d 个文件" % files)
+                else:
+                    states["sync"] = (False, "本地目录缺失")
+                if info:
+                    detail = "Windows: %s\\%s   %sx%s   代理 v%s" % (
+                        info.get("host"), info.get("user"),
+                        info.get("screen", {}).get("w"),
+                        info.get("screen", {}).get("h"), info.get("version"))
+                else:
+                    detail = "代理未响应：点「启动」，或查看日志目录。"
+            except Exception as exc:
+                detail = "状态刷新失败：%s" % exc
+            finally:
+                self.msgs.put(("status_done", (states, detail)))
 
         threading.Thread(target=job, daemon=True).start()
 
@@ -1254,6 +1335,153 @@ def _writable(path: str) -> str:
     return path
 
 
+def _test_worker_lifecycle(app, need) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateEventW.argtypes = (wt.LPVOID, wt.BOOL, wt.BOOL, wt.LPCWSTR)
+    kernel32.CreateEventW.restype = wt.HANDLE
+    kernel32.SetEvent.argtypes = (wt.HANDLE,)
+    kernel32.CloseHandle.argtypes = (wt.HANDLE,)
+    kernel32.OpenProcess.argtypes = (wt.DWORD, wt.BOOL, wt.DWORD)
+    kernel32.OpenProcess.restype = wt.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = (wt.HANDLE, ctypes.POINTER(wt.DWORD))
+    kernel32.TerminateProcess.argtypes = (wt.HANDLE, wt.UINT)
+    baseline = {thread.ident for thread in threading.enumerate()
+                if thread.name in ("log-follow", "ps-output")}
+    original_refresh = app.refresh_status
+    app.refresh_status = lambda: None
+    try:
+        for mode in ("success", "failure", "timeout", "exception"):
+            with tempfile.TemporaryDirectory(prefix="wlb-gui-test-") as directory:
+                event_name = "Local\\WlbGui-" + os.path.basename(directory)
+                gate = kernel32.CreateEventW(None, True, False, event_name)
+                child_handle = None
+                pid_path = os.path.join(directory, "child.pid")
+                script = os.path.join(directory, "installer.ps1")
+                common = os.path.join(SCRIPT_DIR, "winbridge_common.ps1")
+                text = (
+                    ". '%s'\n"
+                    "$gate = [Threading.EventWaitHandle]::OpenExisting('%s')\n"
+                    "$child = Start-WbBackgroundProcess -FilePath '%s' "
+                    "-Arguments @('-u','-c','import threading; "
+                    "threading.Event().wait(60)')\n"
+                    "[IO.File]::WriteAllText('%s', [string]$child.Process.Id)\n"
+                    "$child.Process.Dispose()\n"
+                    "Write-Host 'fixture-live'\n"
+                    "$null = $gate.WaitOne(8000)\n"
+                    "Write-Host '== Done'\n"
+                    "Write-Host 'fixture-tail'\n"
+                    "exit %d\n"
+                ) % (common.replace("'", "''"), event_name,
+                     sys.executable.replace("'", "''"),
+                     pid_path.replace("'", "''"),
+                     7 if mode == "failure" else 0)
+                with open(script, "w", encoding="utf-8-sig") as output:
+                    output.write(text)
+                lines = []
+                results = []
+                ticks = []
+
+                def on_line(line):
+                    lines.append(line)
+                    app._install_line(line)
+                    if line == "fixture-live" and mode != "timeout":
+                        kernel32.SetEvent(gate)
+
+                def operation():
+                    if mode == "exception":
+                        raise RuntimeError("fixture worker failure")
+                    result = run_ps_stream(script, on_line=on_line, timeout=3)
+                    results.append(result)
+                    app.set_progress(100 if result == 0 else None,
+                                     "部署完成" if result == 0 else "部署失败")
+
+                def check_finished():
+                    if app.busy:
+                        app.after(20, check_finished)
+                    else:
+                        app.quit()
+
+                guard = None
+                try:
+                    app.btn_install.configure(
+                        command=lambda: app._worker("fixture", operation))
+                    app.btn_install.invoke()
+                    need(app.busy, "worker-%s-started-by-click" % mode)
+                    app.after(40, lambda: ticks.append(app.busy))
+                    guard = app.after(8000, app.quit)
+                    app.after(20, check_finished)
+                    app.mainloop()
+                    need(not app.busy, "worker-%s-unlocked" % mode)
+                    buttons = (app.btn_install, app.btn_refresh, app.btn_probe,
+                               app.btn_start, app.btn_stop)
+                    need(all(not button.instate(["disabled"])
+                             for button in buttons),
+                         "worker-%s-all-buttons-enabled" % mode)
+                    if mode == "exception":
+                        need(app.phase_var.get() == "已中断",
+                             "worker-exception-reported")
+                    else:
+                        need(bool(ticks) and ticks[0],
+                             "worker-%s-ui-responsive-while-running" % mode)
+                        need("fixture-live" in lines,
+                             "worker-%s-live-output" % mode)
+                        expected = {"success": 0, "failure": 7, "timeout": -1}
+                        need(results == [expected[mode]],
+                             "worker-%s-exit-result" % mode)
+                        phase = "部署完成" if mode == "success" else "部署失败"
+                        need(app.phase_var.get() == phase,
+                             "worker-%s-final-phase" % mode)
+                        if mode != "timeout":
+                            need("fixture-tail" in lines,
+                                 "worker-%s-final-output-drained" % mode)
+                        if os.path.isfile(pid_path):
+                            with open(pid_path, encoding="ascii") as source:
+                                child_handle = kernel32.OpenProcess(
+                                    0x1001, False, int(source.read().strip()))
+                        exit_code = wt.DWORD()
+                        alive = (child_handle and kernel32.GetExitCodeProcess(
+                            child_handle, ctypes.byref(exit_code))
+                            and exit_code.value == 259)
+                        need(bool(alive),
+                             "worker-%s-child-alive-after-unlock" % mode)
+                    remaining = {thread.ident for thread in threading.enumerate()
+                                 if thread.name in ("log-follow", "ps-output")}
+                    need(remaining <= baseline,
+                         "worker-%s-no-log-thread-leak" % mode)
+                finally:
+                    if guard:
+                        app.after_cancel(guard)
+                    if child_handle:
+                        kernel32.TerminateProcess(child_handle, 0)
+                        kernel32.CloseHandle(child_handle)
+                    kernel32.CloseHandle(gate)
+    finally:
+        app.refresh_status = original_refresh
+        app.btn_install.configure(command=app.on_install)
+
+    with tempfile.TemporaryDirectory(prefix="wlb-gui-logs-") as directory:
+        arrived = threading.Event()
+        lines = []
+
+        def receive(line):
+            lines.append(line)
+            arrived.set()
+
+        follower = LogFollower(directory, ["sample.log"], receive)
+        follower.start()
+        try:
+            need(follower.ready.wait(2), "log-notification-ready")
+            with open(os.path.join(directory, "sample.log"), "wb") as output:
+                output.write(b"live log\n")
+                output.flush()
+                need(arrived.wait(2), "log-visible-before-writer-close")
+            need(lines == ["[sample] live log"], "log-notification-no-duplicates")
+        finally:
+            follower.stop()
+            follower.join(timeout=2)
+        need(not follower.is_alive(), "log-notification-stop-interrupts-wait")
+
+
 def uitest() -> int:
     """Builds the real window once and asserts the controls exist. No mainloop."""
     problems = []
@@ -1315,6 +1543,13 @@ def uitest() -> int:
          "ignore-nonterminal-done")
 
     try:
+        _test_worker_lifecycle(app, need)
+    except Exception as exc:
+        need(False, "worker-lifecycle: %s" % exc)
+
+    try:
+        app.follower.stop()
+        app.follower.join(timeout=5)
         app.destroy()
     except Exception:
         pass

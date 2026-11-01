@@ -14,7 +14,7 @@ Event-driven execution, observable deployment and windowless background operatio
 
 - Installation progress with named phases and percentages in the GUI; installer,
   update and verification output is streamed into the existing log panel.
-- Filesystem-event log following with `ReadDirectoryChangesW` for supervisor, tunnel
+- Interruptible filesystem-event log following for supervisor, tunnel
   and agent logs, without repeatedly rereading the whole log files.
 - Optional bounded `/job/start` submit-and-wait: short tasks return their result in
   the start response; longer tasks retain their durable job identity for follow-up.
@@ -47,6 +47,19 @@ Event-driven execution, observable deployment and windowless background operatio
 
 ### Fixed
 
+- Installation could show Done while every action button remained disabled:
+  a long-lived supervisor inherited the installer output pipe, so waiting for
+  EOF never completed. GUI command execution now waits for the installer itself,
+  stops its blocking reader with `CancelSynchronousIo` and drains trailing output
+  without stopping the supervisor or tunnel.
+- Worker completion, status updates and button unlocking are delivered through
+  the UI queue. Configuration is captured on the UI thread, and repeated status
+  refreshes are coalesced instead of reading or mutating Tk controls from workers.
+- Log notifications wait on filesystem changes or an explicit shutdown event;
+  shutdown wakes the watcher and releases its native handles.
+- Real GUI lifecycle checks click the install button repeatedly, keep a fixture
+  child alive after completion, verify live/trailing output and UI responsiveness,
+  and cover nonzero exit, timeout, exception handling and thread cleanup.
 - GUI installation progress reaches 100% as soon as the installer emits the
   exact `== Done` completion marker, rather than remaining at 94% until process
   exit and output-pipe closure. GUI regression checks cover the progress bar,
@@ -80,7 +93,7 @@ Event-driven execution, observable deployment and windowless background operatio
 ### Verification
 
 - Windows `tools/verify.ps1 -Port 19887`: 44/44 checks passed, including the new
-  no-console and filesystem-event live-log checks. GUI checks: 11 selftests and 14 UI checks.
+  no-console and filesystem-event live-log checks. GUI checks: 11 selftests and 58 UI checks.
 - No universal speedup multiplier is claimed: workload, shell, storage and tunnel
   latency differ. Structured `--exe` + argument lists remain the preferred shell-free path.
 - Live Linux installation, reconnect and login/watchdog execution were not revalidated
