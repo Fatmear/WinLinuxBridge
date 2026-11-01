@@ -90,6 +90,22 @@ MAX_TIMEOUT = 7 * 24 * 3600.0
 SUMMARY_HEAD = 2000
 SUMMARY_TAIL = 2000
 
+def _interval(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name) or default)
+        return min(5.0, max(1.0, value))
+    except ValueError:
+        return default
+
+
+META_FLUSH_S = _interval("WL_META_FLUSH_S", 2.0)
+HEARTBEAT_S = _interval("WL_JOB_HEARTBEAT_S", 1.0)
+DURABLE_FIELDS = frozenset({
+    "state", "pid", "exit_code", "error_code", "detail", "started_at",
+    "finished_at", "cancel_requested", "timeout_hit", "deduplicated",
+    "orphaned", "note", "cancel_note", "request_id", "timings",
+})
+
 POWERSHELL_PREAMBLE = (
     "$ErrorActionPreference='Continue'\n"
     "$ProgressPreference='SilentlyContinue'\n"
@@ -101,8 +117,15 @@ POWERSHELL_PREAMBLE = (
 # --------------------------------------------------------------------------- #
 # small helpers
 # --------------------------------------------------------------------------- #
-def now_iso() -> str:
+def now_iso(ms: bool = False) -> str:
+    if ms:
+        return datetime.now().astimezone().isoformat(timespec="milliseconds")
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def now_ms() -> float:
+    """Monotonic milliseconds, for phase timings only."""
+    return time.perf_counter() * 1000.0
 
 
 def decode_bytes(raw: bytes) -> str:
@@ -115,12 +138,19 @@ def decode_bytes(raw: bytes) -> str:
     return raw.decode("utf-8", "replace")
 
 
-def _atomic_write_json(path: str, obj: dict) -> None:
+def _atomic_write_json(path: str, obj: dict, durable: bool = True) -> None:
+    """Atomic replace. `durable=False` skips fsync (heartbeat merges).
+
+    The rename is atomic either way, so a reader never sees a half written
+    file; skipping fsync only gives up crash-durability of that one update,
+    which is exactly what a heartbeat does not need.
+    """
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(obj, fh, ensure_ascii=False, indent=1)
         fh.flush()
-        os.fsync(fh.fileno())
+        if durable:
+            os.fsync(fh.fileno())
     os.replace(tmp, path)
 
 
@@ -295,11 +325,86 @@ class JobManager:
         for path in (self.jobs_dir, self.requests_dir, self.temp_dir):
             os.makedirs(path, exist_ok=True)
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()          # re-entrant: meta writes nest
+        self._cond = threading.Condition(self._lock)
         self._resource_locks = {}
         self._procs = {}
         self._stop_flags = {}
         self._started = now_iso()
+        self._started_ms = now_ms()
+
+        # In-memory truth for every job this agent has touched. Disk is the
+        # durable copy, memory is what queries read, so a status poll never has
+        # to open a file while the job is running.
+        self._meta = {}
+        self._dirty = set()
+        self._timings = {}
+        self._write_ms = {}
+        self._t_created = {}
+        self._closing = False
+        self._close_event = threading.Event()
+        self._flush_event = threading.Event()
+        self._flusher = threading.Thread(target=self._flush_loop,
+                                         name="job-meta-flush", daemon=True)
+        self._flusher.start()
+
+    def _flush_loop(self) -> None:
+        while not self._close_event.is_set():
+            self._flush_event.wait()
+            self._flush_event.clear()
+            if self._close_event.wait(META_FLUSH_S):
+                break
+            try:
+                self.flush_dirty()
+            except OSError:
+                log.exception("metadata flush failed")
+                self._flush_event.set()
+
+    def flush_dirty(self) -> int:
+        with self._lock:
+            pending = list(self._dirty)
+            for job_id in pending:
+                meta = self._meta.get(job_id)
+                if meta is not None:
+                    self._store_meta(job_id, meta, durable=False)
+            return len(pending)
+
+    def request_flush(self) -> None:
+        self._flush_event.set()
+
+    def close(self) -> None:
+        self._closing = True
+        self._close_event.set()
+        self._flush_event.set()
+        self._flusher.join()
+        self.flush_dirty()
+
+    def _load_meta(self, job_id: str) -> dict:
+        with self._lock:
+            meta = self._meta.get(job_id)
+            if meta is None:
+                meta = _read_json(self._meta_path(job_id))
+                if meta:
+                    self._meta[job_id] = meta
+            return dict(meta or {})
+
+    def _store_meta(self, job_id: str, meta: dict, durable: bool) -> None:
+        with self._lock:
+            started = now_ms()
+            try:
+                _atomic_write_json(self._meta_path(job_id), meta, durable=durable)
+                self._meta[job_id] = meta
+                self._dirty.discard(job_id)
+            finally:
+                self._write_ms[job_id] = self._write_ms.get(job_id, 0.0) + now_ms() - started
+
+    def _timing(self, job_id: str, key: str, value: float) -> None:
+        with self._lock:
+            self._timings.setdefault(job_id, {})[key] = round(float(value), 3)
+
+    def _created_ms(self, job_id: str) -> float:
+        with self._lock:
+            return self._t_created.get(job_id, now_ms())
 
     # -- paths ------------------------------------------------------------ #
     def job_dir(self, job_id: str) -> str:
@@ -340,6 +445,8 @@ class JobManager:
                 # note that we can no longer stream to it.
                 meta["orphaned"] = True
                 _atomic_write_json(self._meta_path(name), meta)
+                with self._lock:
+                    self._meta[name] = meta
                 continue
             meta["state"] = LOST
             meta["error_code"] = "JOB_LOST"
@@ -347,6 +454,8 @@ class JobManager:
             meta["last_activity"] = now_iso()
             meta["note"] = "agent restarted and the recorded pid is gone; outcome unknown"
             _atomic_write_json(self._meta_path(name), meta)
+            with self._lock:
+                self._meta[name] = meta
             fixed += 1
         if fixed:
             log.info("recovered %d job(s) as LOST after restart", fixed)
@@ -374,6 +483,12 @@ class JobManager:
             try:
                 shutil.rmtree(path, ignore_errors=True)
                 removed += 1
+                with self._lock:
+                    self._meta.pop(name, None)
+                    self._timings.pop(name, None)
+                    self._write_ms.pop(name, None)
+                    self._t_created.pop(name, None)
+                    self._dirty.discard(name)
             except Exception:
                 pass
         return removed
@@ -381,6 +496,8 @@ class JobManager:
     # -- start ------------------------------------------------------------- #
     def start(self, payload: dict) -> dict:
         """Starts a job and returns immediately. Never blocks on the job."""
+        t_entry = now_ms()
+        recv_ms = payload.get("_perf_recv_ms")
         request_id = str(payload.get("request_id") or "").strip()
 
         if request_id:
@@ -407,6 +524,7 @@ class JobManager:
                                             "cwd does not exist: %s" % cwd)
 
         argv, temp_path, shell_label = build_argv(payload, self.temp_dir)
+        t_argv = now_ms()
 
         job_id = "j%s_%s" % (datetime.now().strftime("%Y%m%d_%H%M%S"), uuid.uuid4().hex[:8])
         os.makedirs(self.job_dir(job_id), exist_ok=True)
@@ -429,6 +547,7 @@ class JobManager:
             "timeout": timeout,
             "on_timeout": str(payload.get("on_timeout") or "kill").lower(),
             "created_at": now_iso(),
+            "created_at_ms": now_iso(ms=True),
             "started_at": "",
             "finished_at": "",
             "last_activity": now_iso(),
@@ -441,9 +560,25 @@ class JobManager:
             "timeout_hit": False,
             "agent_version": VERSION_OF_AGENT,
         }
-        _atomic_write_json(self._meta_path(job_id), meta)
+        self._store_meta(job_id, meta, durable=True)
+        with self._lock:
+            self._meta[job_id] = meta
         if request_id:
             _atomic_write_json(self._request_path(request_id), {"job_id": job_id})
+
+        self._timings[job_id] = {
+            "request_parse_ms": round(max(0.0, t_entry - recv_ms), 3) if recv_ms else 0.0,
+            "build_argv_ms": round(max(0.0, t_argv - t_entry), 3),
+            "metadata_write_ms": 0.0,
+            "queue_wait_ms": 0.0,
+            "process_spawn_ms": 0.0,
+            "process_run_ms": 0.0,
+            "completion_detect_ms": 0.0,
+            "result_build_ms": 0.0,
+        }
+        self._t_created[job_id] = t_entry
+        self._timings[job_id]["metadata_write_ms"] = round(
+            self._write_ms.get(job_id, 0.0), 3)
 
         self._stop_flags[job_id] = threading.Event()
         runner = threading.Thread(
@@ -453,6 +588,7 @@ class JobManager:
             daemon=True,
         )
         runner.start()
+        self._timing(job_id, "start_return_ms", now_ms() - t_entry)
 
         info = self.status(job_id, wait=0.0)
         info["request_id"] = request_id
@@ -483,7 +619,9 @@ class JobManager:
             "detail": detail,
             "agent_version": VERSION_OF_AGENT,
         }
-        _atomic_write_json(self._meta_path(job_id), meta)
+        self._store_meta(job_id, meta, durable=True)
+        with self._lock:
+            self._meta[job_id] = meta
         if request_id:
             _atomic_write_json(self._request_path(request_id), {"job_id": job_id})
         info = self.status(job_id, wait=0.0)
@@ -498,6 +636,7 @@ class JobManager:
         proc = None
         acquired = None
         stdin_path = None
+        run_started = 0.0
         try:
             if resource:
                 acquired = self._acquire_resource(resource)
@@ -507,17 +646,21 @@ class JobManager:
                                  detail="another job kept resource %s busy too long" % resource,
                                  out=None, err=None)
                     return
+                self._timing(job_id, "queue_wait_ms", now_ms() - self._created_ms(job_id))
                 self._patch(job_id, state=RUNNING, started_at=now_iso(),
                             last_activity=now_iso(),
                             note="resource acquired: %s" % resource)
             else:
+                self._timing(job_id, "queue_wait_ms", now_ms() - self._created_ms(job_id))
                 self._patch(job_id, state=RUNNING, started_at=now_iso(), last_activity=now_iso())
 
             stdin_data = payload.get("stdin")
+            stdin_fh = subprocess.DEVNULL
             if stdin_data is not None:
                 stdin_path = _mkstemp(self.temp_dir, ".stdin")
                 with open(stdin_path, "wb") as fh:
                     fh.write(str(stdin_data).encode("utf-8"))
+                stdin_fh = open(stdin_path, "rb")
 
             flags = 0
             if os.name == "nt":
@@ -528,15 +671,24 @@ class JobManager:
                 "env": env,
                 "stdout": out_cap.fh,
                 "stderr": err_cap.fh,
-                "stdin": open(stdin_path, "rb") if stdin_path else subprocess.DEVNULL,
+                "stdin": stdin_fh,
                 "creationflags": flags,
             }
+            t_spawn = now_ms()
             try:
                 proc = subprocess.Popen(argv, **kwargs)
             except (OSError, ValueError) as exc:
+                self._timing(job_id, "process_spawn_ms", now_ms() - t_spawn)
                 self._finish(job_id, SPAWN_ERROR, None, "SPAWN_FAILED",
                              detail="cannot start process: %s" % exc, out=out_cap, err=err_cap)
                 return
+            finally:
+                if stdin_fh is not subprocess.DEVNULL:
+                    try:
+                        stdin_fh.close()
+                    except Exception:
+                        pass
+            self._timing(job_id, "process_spawn_ms", now_ms() - t_spawn)
 
             with self._lock:
                 self._procs[job_id] = proc
@@ -544,9 +696,28 @@ class JobManager:
 
             stop = self._stop_flags.get(job_id)
             deadline = time.time() + timeout
-            while True:
-                rc = proc.poll()
-                if rc is not None:
+            run_started = now_ms()
+
+            # Event driven instead of "sleep 150 ms and poll": the watcher thread
+            # blocks in proc.wait() (a real OS wait) and sets `done` the moment
+            # the child exits, so a 5 ms command is noticed in ~0 ms.
+            done = threading.Event()
+
+            def _watch(p=proc, ev=done):
+                try:
+                    p.wait()
+                except Exception:  # noqa: BLE001
+                    pass
+                ev.set()
+
+            threading.Thread(target=_watch, name="job-watch-" + job_id,
+                             daemon=True).start()
+
+            next_beat = time.time() + HEARTBEAT_S
+            while not done.is_set():
+                wait_for = min(HEARTBEAT_S, max(0.0, deadline - time.time()))
+                done.wait(wait_for)
+                if done.is_set():
                     break
                 if stop is not None and stop.is_set():
                     self._kill_tree(proc.pid)
@@ -554,6 +725,7 @@ class JobManager:
                         proc.wait(timeout=10)
                     except subprocess.TimeoutExpired:
                         pass
+                    self._timing(job_id, "process_run_ms", now_ms() - run_started)
                     cleanup = self._cleanup_report(proc.pid)
                     self._finish(job_id, CANCELLED, proc.returncode, "CANCELLED_BY_REQUEST",
                                  detail="cancelled on request", out=out_cap, err=err_cap,
@@ -565,6 +737,7 @@ class JobManager:
                         proc.wait(timeout=10)
                     except subprocess.TimeoutExpired:
                         pass
+                    self._timing(job_id, "process_run_ms", now_ms() - run_started)
                     cleanup = self._cleanup_report(proc.pid)
                     self._finish(job_id, TIMEOUT, proc.returncode, "TIMEOUT_KILLED",
                                  detail="execution timeout after %gs" % timeout,
@@ -575,12 +748,23 @@ class JobManager:
                     return
                 out_cap.enforce_cap()
                 err_cap.enforce_cap()
-                self._patch(job_id, last_activity=now_iso())
-                time.sleep(0.15)
+                if time.time() >= next_beat:
+                    # Heartbeat: memory only. The flusher merges it to disk.
+                    self._patch(job_id, last_activity=now_iso())
+                    next_beat = time.time() + HEARTBEAT_S
 
+            t_exit = now_ms()
+            self._timing(job_id, "process_run_ms", t_exit - run_started)
+            rc = proc.returncode
+            if stop is not None and stop.is_set():
+                self._finish(job_id, CANCELLED, rc, "CANCELLED_BY_REQUEST",
+                             detail="cancelled on request", out=out_cap, err=err_cap,
+                             extra={"cancel_cleanup": self._cleanup_report(proc.pid)})
+                return
             self._finish(job_id, SUCCEEDED if rc == 0 else FAILED, rc,
                          "" if rc == 0 else "PROCESS_EXIT_NONZERO",
-                         detail="", out=out_cap, err=err_cap)
+                         detail="", out=out_cap, err=err_cap,
+                         detect_from=t_exit)
         except Exception as exc:  # noqa: BLE001
             log.error("job %s crashed: %s", job_id, exc)
             self._finish(job_id, SPAWN_ERROR, None, "SPAWN_FAILED",
@@ -590,6 +774,8 @@ class JobManager:
             err_cap.close()
             with self._lock:
                 self._procs.pop(job_id, None)
+                self._timings.pop(job_id, None)
+                self._t_created.pop(job_id, None)
             self._stop_flags.pop(job_id, None)
             if acquired is not None:
                 try:
@@ -605,13 +791,20 @@ class JobManager:
 
     def _finish(self, job_id: str, state: str, exit_code, error_code: str,
                 detail: str = "", out=None, err=None,
-                extra: dict = None) -> None:
+                extra: dict = None, detect_from: float = None) -> None:
         if out is not None:
             out.flush()
         if err is not None:
             err.flush()
         stdout_path = self._stdout_path(job_id)
         stderr_path = self._stderr_path(job_id)
+        t0 = now_ms()
+        with self._lock:
+            timings = dict(self._timings.get(job_id, {}))
+        timings["metadata_write_ms"] = round(self._write_ms.get(job_id, 0.0), 3)
+        if detect_from:
+            timings["completion_detect_ms"] = round(max(0.0, t0 - detect_from), 3)
+        timings["total_ms"] = round(max(0.0, t0 - self._created_ms(job_id)), 3)
         patch = {
             "state": state,
             "exit_code": exit_code,
@@ -627,22 +820,50 @@ class JobManager:
             "stderr_truncated": bool(err.truncated) if err is not None else False,
             "stdout_path": stdout_path,
             "stderr_path": stderr_path,
+            "timings": timings,
         }
         if extra:
             patch.update(extra)
         self._patch(job_id, **patch)
-
-    def _patch(self, job_id: str, **fields) -> None:
-        path = self._meta_path(job_id)
+        # The durable write above is itself part of metadata_write_ms; fold the
+        # final figure back in memory and let the flusher merge it (no fsync).
         with self._lock:
-            meta = _read_json(path)
-            if not meta:
-                return
+            meta = self._meta.get(job_id)
+            if meta:
+                merged = dict(meta.get("timings") or {})
+                merged["metadata_write_ms"] = round(self._write_ms.get(job_id, 0.0), 3)
+                meta["timings"] = merged
+                self._dirty.add(job_id)
+
+    def _patch(self, job_id: str, durable=None, **fields) -> None:
+        """Updates a job record.
+
+        `durable=None` (default) decides from the field names: anything that
+        changes the meaning of the job is written and fsynced at once, while a
+        plain heartbeat only marks the record dirty and is merged by the
+        flusher thread. Callers waiting in `status(wait=...)` are woken here,
+        so a poll never has to sit through a fixed 200 ms sleep.
+        """
+        with self._cond:
+            meta = self._meta.get(job_id)
+            if meta is None:
+                meta = _read_json(self._meta_path(job_id))
+                if not meta:
+                    return
             meta.update(fields)
-            try:
-                _atomic_write_json(path, meta)
-            except OSError:
-                pass
+            must_write = any(key in DURABLE_FIELDS for key in fields)
+            if durable is not None:
+                must_write = bool(durable) or must_write
+            self._meta[job_id] = meta
+            if must_write:
+                self._store_meta(job_id, meta, durable=True)
+                # Only a change that carries meaning wakes the waiters. A
+                # heartbeat must not wake every long poll (that would turn
+                # notifications back into polling).
+                self._cond.notify_all()
+            else:
+                self._dirty.add(job_id)
+                self._flush_event.set()
 
     def _acquire_resource(self, key: str):
         with self._lock:
@@ -654,7 +875,7 @@ class JobManager:
 
     # -- cancel ------------------------------------------------------------ #
     def cancel(self, job_id: str, note: str = "") -> dict:
-        meta = _read_json(self._meta_path(job_id))
+        meta = self._load_meta(job_id)
         if not meta:
             raise FileNotFoundError("no such job: %s" % job_id)
         state = meta.get("state")
@@ -664,20 +885,23 @@ class JobManager:
                                      "state": state}
             return info
 
-        flag = self._stop_flags.get(job_id)
-        if flag is not None:
-            flag.set()
         pid = int(meta.get("pid") or 0)
-        killed = self._kill_tree(pid) if pid else 0
         self._patch(job_id, cancel_requested=True,
                     last_activity=now_iso(),
                     cancel_note=note or "cancelled via /job/cancel")
-        # Give the runner a moment to record the final state itself.
-        for _ in range(40):
-            meta = _read_json(self._meta_path(job_id))
-            if meta.get("state") in TERMINAL_STATES:
-                break
-            time.sleep(0.1)
+        flag = self._stop_flags.get(job_id)
+        if flag is not None:
+            flag.set()
+        killed = self._kill_tree(pid) if pid else 0
+        # The runner wakes us through the condition variable the instant it
+        # records the final state; no fixed-interval sleeping.
+        deadline = time.time() + 5.0
+        with self._cond:
+            while (self._meta.get(job_id) or {}).get("state") not in TERMINAL_STATES:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                self._cond.wait(remaining)
         info = self.status(job_id, wait=0.0)
         info["cancel_result"] = {"killed": killed,
                                  "already_finished": False,
@@ -696,21 +920,17 @@ class JobManager:
             return 0
         was_alive = _pid_alive(pid)
         try:
-            result = subprocess.run(
+            subprocess.run(
                 ["taskkill", "/T", "/F", "/PID", str(pid)],
                 capture_output=True, timeout=30,
                 creationflags=CREATE_NO_WINDOW,
             )
-            rc = result.returncode
         except Exception as exc:  # noqa: BLE001
             log.warning("taskkill failed for pid %s: %s", pid, exc)
             return 0
-        deadline = time.time() + 5.0
-        while time.time() < deadline:
-            if not _pid_alive(pid):
-                return 1 if was_alive else 0
-            time.sleep(0.1)
-        return 0
+        # Real kernel wait on the process handle: no 100 ms sleep loop.
+        gone = _wait_pid_gone(pid, 5.0)
+        return 1 if (gone and was_alive) else 0
 
     def _cleanup_report(self, pid: int) -> dict:
         if not pid:
@@ -726,21 +946,33 @@ class JobManager:
         return ""
 
     def status(self, job_id: str, wait: float = 0.0) -> dict:
-        """Returns the machine readable record. `wait` long-polls for a change."""
-        path = self._meta_path(job_id)
-        if not os.path.isfile(path):
-            raise FileNotFoundError("no such job: %s" % job_id)
-        deadline = time.time() + max(0.0, min(float(wait or 0), 120.0))
-        meta = _read_json(path)
-        snapshot = (meta.get("state"), meta.get("last_activity"))
-        while time.time() < deadline:
-            if meta.get("state") in TERMINAL_STATES:
-                break
-            time.sleep(0.2)
-            meta = _read_json(path)
-            if (meta.get("state"), meta.get("last_activity")) != snapshot:
-                snapshot = (meta.get("state"), meta.get("last_activity"))
-                break
+        """Returns the machine readable record. `wait` long-polls for a change.
+
+        The record is read from memory. Waiting is a condition variable that
+        `_patch` signals, so a state change is observed immediately instead of
+        after a fixed 200 ms sleep; the socket timeout still applies because the
+        wait is capped at the client's own budget.
+        """
+        window = max(0.0, min(float(wait or 0), 120.0))
+        deadline = time.time() + window
+        with self._cond:
+            meta = self._meta.get(job_id)
+            if meta is None:
+                meta = _read_json(self._meta_path(job_id))
+                if not meta:
+                    raise FileNotFoundError("no such job: %s" % job_id)
+                self._meta[job_id] = meta
+            snapshot = (meta.get("state"), meta.get("last_activity"))
+            while meta.get("state") not in TERMINAL_STATES:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                self._cond.wait(min(remaining, 0.5))
+                meta = self._meta.get(job_id) or meta
+                current = (meta.get("state"), meta.get("last_activity"))
+                if current != snapshot:
+                    snapshot = current
+                    break
         return self._render(job_id, meta)
 
     def _render(self, job_id: str, meta: dict) -> dict:
@@ -761,25 +993,41 @@ class JobManager:
             "timeout": meta.get("timeout"),
             "pid": meta.get("pid", 0),
             "created_at": meta.get("created_at", ""),
+            "created_at_ms": meta.get("created_at_ms", ""),
             "started_at": meta.get("started_at", ""),
             "finished_at": meta.get("finished_at", ""),
             "last_activity": meta.get("last_activity", ""),
-            "cancel_requested": bool(meta.get("cancel_requested")),
-            "timeout_hit": bool(meta.get("timeout_hit")),
-            "orphaned": bool(meta.get("orphaned")),
-            "agent_version": meta.get("agent_version", ""),
-            "stdout_bytes": _file_bytes(stdout_path),
-            "stderr_bytes": _file_bytes(stderr_path),
-            "stdout_truncated": bool(meta.get("stdout_truncated")),
-            "stderr_truncated": bool(meta.get("stderr_truncated")),
-            "stdout_path": stdout_path,
-            "stderr_path": stderr_path,
-            "stdout_sha256": meta.get("stdout_sha256") or _sha256_file(stdout_path),
-            "stderr_sha256": meta.get("stderr_sha256") or _sha256_file(stderr_path),
+            "timings": meta.get("timings") or {},
         }
         for key in ("cancel_cleanup", "kill_result", "cancel_note", "note"):
             if meta.get(key):
                 info[key] = meta[key]
+        return info
+
+    def wait_terminal(self, job_id: str, timeout: float) -> dict:
+        """Blocks until the job reaches a terminal state or the budget expires.
+
+        This is a condition-variable wait, not a poll: the moment the runner
+        records the final state the caller is woken. `timeout` simply bounds how
+        long a *client* is willing to wait; the job keeps running regardless.
+        """
+        window = max(0.0, min(float(timeout or 0), MAX_TIMEOUT))
+        deadline = time.time() + window
+        with self._cond:
+            meta = self._meta.get(job_id)
+            if meta is None:
+                meta = _read_json(self._meta_path(job_id))
+                if not meta:
+                    raise FileNotFoundError("no such job: %s" % job_id)
+                self._meta[job_id] = meta
+            while meta.get("state") not in TERMINAL_STATES:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                self._cond.wait(remaining)
+                meta = self._meta.get(job_id) or meta
+        info = self._render(job_id, meta)
+        info["waited_ms"] = round(window * 1000.0, 1) if info.get("state") not in TERMINAL_STATES else 0.0
         return info
 
     def read_log(self, job_id: str, which: str = "stdout", since: int = 0,
@@ -809,9 +1057,13 @@ class JobManager:
 
     def read_result(self, job_id: str, head: int = SUMMARY_HEAD,
                     tail: int = SUMMARY_TAIL) -> dict:
+        started = now_ms()
         info = self.status(job_id, wait=0.0)
         info["stdout"] = _summarize(self._stdout_path(job_id), head, tail)
         info["stderr"] = _summarize(self._stderr_path(job_id), head, tail)
+        timings = dict(info.get("timings") or {})
+        timings["result_build_ms"] = round(now_ms() - started, 3)
+        info["timings"] = timings
         return info
 
     def list_jobs(self, limit: int = 50, request_id: str = "") -> dict:
@@ -917,6 +1169,33 @@ def _pid_alive(pid: int) -> bool:
             ctypes.windll.kernel32.CloseHandle(handle)
     except Exception:
         return False
+
+
+def _wait_pid_gone(pid: int, timeout: float) -> bool:
+    """Blocks on the process handle until it exits. True when it is gone.
+
+    SYNCHRONIZE + WaitForSingleObject is a kernel wait, so confirming a kill
+    costs no polling at all — the thread sleeps until the process object is
+    signalled.
+    """
+    if not pid:
+        return True
+    try:
+        import ctypes
+
+        SYNCHRONIZE = 0x00100000
+        WAIT_OBJECT_0 = 0x0
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if not handle:
+            return True  # already gone, or not ours to watch
+        try:
+            rc = kernel32.WaitForSingleObject(handle, int(max(0.0, timeout) * 1000))
+            return rc == WAIT_OBJECT_0
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return not _pid_alive(pid)
 
 
 # The agent sets this before creating the manager so records can be audited.

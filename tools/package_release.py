@@ -19,6 +19,7 @@ import hashlib
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -162,6 +163,30 @@ def main(argv) -> int:
                   % len(problems), file=sys.stderr)
             return 3
         print("[release] identity scan clean")
+
+    startup_check = """
+import sys, tempfile
+sys.path.insert(0, 'win')
+import winbridge_jobs as jobs
+with tempfile.TemporaryDirectory(prefix='wlb-package-check-') as directory:
+    manager = jobs.JobManager(directory)
+    try:
+        info = manager.start({'exe': sys.executable, 'argv': ['-B', '-c', 'print(123)'], 'timeout': 10})
+        final = manager.wait_terminal(info['job_id'], 15)
+        assert final['state'] == jobs.SUCCEEDED, final
+        assert manager.read_result(info['job_id'])['stdout']['text'].strip() == '123'
+    finally:
+        manager.close()
+print('[release] portable runtime job startup check passed')
+"""
+    try:
+        subprocess.run(
+            [os.path.join(ROOT, "win", "runtime", "python.exe"), "-B", "-c", startup_check],
+            cwd=ROOT, check=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("[release] ERROR job startup check failed: %s" % exc, file=sys.stderr)
+        return 4
 
     os.makedirs(args.out, exist_ok=True)
     zip_name = "WinLinuxBridge-%s.zip" % version

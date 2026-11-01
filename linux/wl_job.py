@@ -58,6 +58,11 @@ def env_float(name: str, default: float) -> float:
 
 CONNECT_TIMEOUT = env_float("WL_CONNECT_TIMEOUT", 5.0)
 WAIT_MARGIN = env_float("WL_WAIT_MARGIN", 30.0)
+# One long-poll request covers this many seconds of waiting. The agent wakes it
+# the moment the job changes, so a bigger window is strictly cheaper.
+STATUS_WAIT = env_float("WL_STATUS_WAIT", 15.0)
+# "submit and wait" for short commands: one round trip instead of three.
+START_WAIT = env_float("WL_START_WAIT", 8.0)
 PORT = int(os.environ.get("WL_AGENT_PORT") or 18080)
 TOKEN = (os.environ.get("WL_AGENT_TOKEN") or "").strip()
 
@@ -178,21 +183,31 @@ def exit_code_for(result: dict) -> int:
 # --------------------------------------------------------------------------- #
 # wait loop: polling a durable job, never blocking on one HTTP request
 # --------------------------------------------------------------------------- #
-def wait_for(job_id: str, deadline: float, poll: float = 2.0) -> dict:
+def wait_for(job_id: str, deadline: float, poll: float = None) -> dict:
+    """Long-polls the agent until the job is terminal or the budget expires.
+
+    The agent answers as soon as the job changes, so a large `poll` window costs
+    nothing: one HTTP request covers up to `poll` seconds of waiting, instead of
+    waking every 2 s to ask "any news?". Fewer round trips, lower latency.
+    """
+    window = STATUS_WAIT if poll is None else poll
     while True:
         remaining = deadline - time.time()
         if remaining <= 0:
             return api("/job/status", {"job_id": job_id, "wait": 0})
+        # Long poll: ask the agent to hold the request until the job changes,
+        # but never past our own deadline.
+        budget = min(window, remaining)
         try:
             info = api("/job/status",
-                       {"job_id": job_id, "wait": min(poll, remaining)},
-                       timeout=max(CONNECT_TIMEOUT, min(poll + 10, remaining + 10)))
+                       {"job_id": job_id, "wait": budget},
+                       timeout=max(CONNECT_TIMEOUT, budget + 15.0))
         except TransportError:
             # Losing the connection while waiting is not a job failure.
             raise
         if info.get("state") in TERMINAL:
             return info
-        if remaining <= 0:
+        if time.time() >= deadline:
             return info
 
 
@@ -233,8 +248,18 @@ def cmd_run(args) -> int:
             return EXIT_USAGE
         payload["cmd"] = " ".join(command)
 
+    # Client wait = execution timeout + transfer margin, unless overridden.
+    wait_seconds = args.wait if args.wait and args.wait > 0 else (float(args.timeout) + WAIT_MARGIN)
+    if not args.no_wait:
+        # Ask the agent to hold the start call briefly: a command that finishes
+        # inside this window comes back complete, so the whole `wl run` is ONE
+        # round trip. Anything slower still returns its durable job id.
+        payload["wait"] = min(START_WAIT, wait_seconds)
+
     try:
-        info = api("/job/start", payload, timeout=max(CONNECT_TIMEOUT, 15.0))
+        info = api("/job/start", payload,
+                   timeout=max(CONNECT_TIMEOUT, 15.0,
+                               min(START_WAIT, wait_seconds) + 10.0))
     except TransportError as exc:
         if args.json:
             emit_json({"request_id": request_id, "job_id": None,
@@ -255,8 +280,11 @@ def cmd_run(args) -> int:
             sys.stdout.write(job_id + "\n")
         return EXIT_OK
 
-    # Client wait = execution timeout + transfer margin, unless overridden.
-    wait_seconds = args.wait if args.wait and args.wait > 0 else (float(args.timeout) + WAIT_MARGIN)
+    if info.get("completed"):
+        info.setdefault("request_id", request_id)
+        render_result(info, out_mode)
+        return exit_code_for(info)
+
     deadline = time.time() + wait_seconds
 
     try:

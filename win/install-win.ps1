@@ -314,13 +314,22 @@ if (-not $NoStart) {
     }
 
     Write-WbLog 'install: starting supervisor' 'install'
-    Start-Process -FilePath $startCmd -WindowStyle Hidden | Out-Null
+    Start-Process -FilePath 'powershell.exe' -ArgumentList @(
+        '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-WindowStyle', 'Hidden', '-File', ('"' + $supervisor + '"')
+    ) -WindowStyle Hidden | Out-Null
     Start-Sleep -Seconds 8
 
     $okAgent = Test-WbAgent -Conf $conf
-    if ($okAgent) { Ok ('agent answers on 127.0.0.1:' + $conf['WL_AGENT_PORT']) } else { Warn 'agent not answering yet (see ~\.winlinuxbridge\logs)' }
+    if (-not $okAgent) {
+        throw 'deployment failed: agent is not responding (see ~/.winlinuxbridge/logs/agent-stderr.log)'
+    }
+    Ok ('agent answers on 127.0.0.1:' + $conf['WL_AGENT_PORT'])
     $r = Invoke-WbRemote -Conf $conf -Command ('{0}/linux/wl ping' -f $remoteRoot) -TimeoutSec 30
-    if ($r.rc -eq 0) { Ok 'end-to-end: Linux -> tunnel -> agent works' } else { Warn ('end-to-end not ready yet: ' + $r.out) }
+    if ($r.rc -ne 0) {
+        throw ('deployment failed: end-to-end check failed: ' + $r.out)
+    }
+    Ok 'end-to-end: Linux -> tunnel -> agent works'
 }
 
 Step 'Done'

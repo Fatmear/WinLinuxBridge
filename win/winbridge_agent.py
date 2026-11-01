@@ -168,29 +168,29 @@ def now_iso() -> str:
 SYNC_WAIT_CEILING = float(os.environ.get("WL_SYNC_WAIT") or 900)
 SYNC_WAIT_MARGIN = 30.0
 
+# /job/start may wait this long for a short command before answering with a
+# job id instead of a result. One round trip for `wl run "ipconfig"`.
+START_WAIT_MAX = float(os.environ.get("WL_START_WAIT_MAX") or 30.0)
+
 
 def run_command(payload: dict) -> dict:
     """Legacy synchronous execution on top of the job engine.
 
     It never blocks longer than the job's own timeout plus a margin, so the
     answer is always truthful: either the job finished, or it is still running
-    and the caller gets the job_id to query later.
+    and the caller gets the job_id to query later. Waiting is a condition
+    variable inside the job engine, so completion is observed immediately.
     """
+    started = time.perf_counter()
     info = JOBS.start(payload)
     job_id = str(info.get("job_id") or "")
     try:
         job_timeout = float(info.get("timeout") or 120)
     except (TypeError, ValueError):
         job_timeout = 120.0
-    started = time.time()
-    deadline = started + min(job_timeout + SYNC_WAIT_MARGIN, SYNC_WAIT_CEILING)
+    budget = min(job_timeout + SYNC_WAIT_MARGIN, SYNC_WAIT_CEILING)
 
-    while True:
-        info = JOBS.status(job_id, wait=1.0)
-        if info.get("state") in jobs.TERMINAL_STATES:
-            break
-        if time.time() >= deadline:
-            break
+    info = JOBS.wait_terminal(job_id, budget)
 
     result = JOBS.read_result(job_id)
     state = result.get("state", "UNKNOWN")
@@ -203,7 +203,8 @@ def run_command(payload: dict) -> dict:
         err_text += "\n[winbridge] execution timeout; the process tree was killed"
     elif still_running:
         err_text += ("\n[winbridge] still running after %.0fs - state is UNKNOWN, "
-                     "not a failure. Query it with: wl job status %s" % (time.time() - started, job_id))
+                     "not a failure. Query it with: wl job status %s"
+                     % (time.perf_counter() - started, job_id))
     elif state == jobs.SPAWN_ERROR:
         err_text += "\n[winbridge] the program could not be started"
 
@@ -213,7 +214,7 @@ def run_command(payload: dict) -> dict:
         "out": stdout.get("text", ""),
         "err": err_text,
         "timed_out": state == jobs.TIMEOUT,
-        "duration_ms": int((time.time() - started) * 1000),
+        "duration_ms": int((time.perf_counter() - started) * 1000),
         "shell": result.get("shell", ""),
         # new fields: transport vs process vs program outcome are separate
         "job_id": job_id,
@@ -233,6 +234,7 @@ def run_command(payload: dict) -> dict:
         "stderr_sha256": stderr.get("sha256", ""),
         "stdout_path": stdout.get("path", ""),
         "stderr_path": stderr.get("path", ""),
+        "timings": result.get("timings", {}),
     }
 
 
@@ -240,14 +242,59 @@ def run_command(payload: dict) -> dict:
 # job endpoints
 # --------------------------------------------------------------------------- #
 def job_start(payload: dict) -> dict:
-    return JOBS.start(payload)
+    """Starts a job, and optionally waits a short window for it to finish.
+
+    `wait` (seconds, capped by WL_START_WAIT_MAX) turns a short command into one
+    round trip: the job is still persisted and given an id first, so nothing is
+    lost if the window expires. An unfinished job returns its normal record with
+    `completed=false` and the caller continues with the async path.
+    """
+    try:
+        window = float(payload.get("wait") or 0.0)
+    except (TypeError, ValueError):
+        window = 0.0
+    window = max(0.0, min(window, START_WAIT_MAX))
+
+    info = JOBS.start(payload)
+    job_id = str(info.get("job_id") or "")
+    if info.get("state") in jobs.TERMINAL_STATES:
+        result = JOBS.read_result(job_id)
+        result["completed"] = True
+        result["deduplicated"] = bool(info.get("deduplicated"))
+        return result
+    if window <= 0 or not job_id:
+        info["completed"] = False
+        return info
+
+    info = JOBS.wait_terminal(job_id, window)
+    if info.get("state") in jobs.TERMINAL_STATES:
+        result = JOBS.read_result(job_id)
+        result["completed"] = True
+        result["deduplicated"] = False
+        return result
+    info["completed"] = False
+    info["waited_s"] = window
+    return info
 
 
 def job_status(payload: dict) -> dict:
+    """Returns a job record, optionally blocking until something changes.
+
+    `wait` is a long-poll budget: the handler sleeps on a condition variable and
+    answers the moment the job changes state, so a client can ask for 15 s and
+    still see a 40 ms job in 40 ms. It never holds the socket longer than the
+    budget.
+    """
     job_id = str(payload.get("job_id") or "").strip()
     if not job_id:
         raise ValueError("'job_id' is required")
-    return JOBS.status(job_id, wait=float(payload.get("wait") or 0.0))
+    try:
+        window = float(payload.get("wait") or 0.0)
+    except (TypeError, ValueError):
+        window = 0.0
+    if window > 0:
+        return JOBS.status(job_id, wait=window)
+    return JOBS.status(job_id, wait=0.0)
 
 
 def job_logs(payload: dict) -> dict:
@@ -343,8 +390,16 @@ def doctor(payload: dict) -> dict:
         "run_default_s": jobs.DEFAULT_TIMEOUT,
         "sync_wait_ceiling_s": SYNC_WAIT_CEILING,
         "sync_wait_margin_s": SYNC_WAIT_MARGIN,
+        "start_wait_max_s": START_WAIT_MAX,
         "max_job_timeout_s": jobs.MAX_TIMEOUT,
         "capture_cap_bytes": jobs.MAX_CAPTURE_BYTES,
+    }
+    persistence = {
+        "meta_flush_s": jobs.META_FLUSH_S,
+        "heartbeat_s": jobs.HEARTBEAT_S,
+        "durable_fields": sorted(jobs.DURABLE_FIELDS),
+        "note": "state/pid/exit_code/finish are fsynced at once; heartbeats "
+                "are merged to disk every meta_flush_s without fsync",
     }
     paths = {
         "state_root": APP_DIR,
@@ -982,6 +1037,7 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch("POST")
 
     def _dispatch(self, method: str):
+        t_recv = time.perf_counter() * 1000.0
         path = self.path.split("?")[0].rstrip("/") or "/"
         if not self._authorized():
             self._json(401, {"error": "unauthorized", "hint": "Authorization: Bearer <WL_AGENT_TOKEN>"})
@@ -1024,6 +1080,10 @@ class Handler(BaseHTTPRequestHandler):
             method = "GET"
         try:
             payload = self._payload() if method == "POST" else {}
+            if path in ("/run", "/job/start") and isinstance(payload, dict):
+                # Lets the job engine report true request_parse_ms instead of
+                # lumping HTTP read + JSON parse into the job's own time.
+                payload["_perf_recv_ms"] = t_recv
             result = handler(payload)
             self._json(200, result if isinstance(result, dict) else {"result": result})
         except PermissionError as exc:

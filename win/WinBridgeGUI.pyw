@@ -230,6 +230,145 @@ def decode(raw: bytes) -> str:
     return raw.decode("utf-8", "replace")
 
 
+# --------------------------------------------------------------------------- #
+# autostart: a .vbs shim instead of a .cmd
+#
+# A .cmd in the Startup folder (or a scheduled task pointing at one) opens a
+# console window for a moment at every logon. wscript.exe has no console at all
+# and Run(..., 0, False) hides the PowerShell window too, so autostart is
+# genuinely invisible - which is the point.
+# --------------------------------------------------------------------------- #
+def startup_dir() -> str:
+    return os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
+                        "Start Menu", "Programs", "Startup")
+
+
+def autostart_path(ext: str = ".vbs") -> str:
+    return os.path.join(startup_dir(), "WinLinuxBridge" + ext)
+
+
+def write_autostart_vbs(supervisor: str) -> str:
+    """Writes the windowless Startup entry and drops the legacy .cmd one."""
+    os.makedirs(startup_dir(), exist_ok=True)
+    target = autostart_path(".vbs")
+    quoted = supervisor.replace('"', '""')
+    body = (
+        "' WinLinuxBridge autostart (windowless; created by the control panel)\r\n"
+        "Option Explicit\r\n"
+        "Dim sh\r\n"
+        "Set sh = CreateObject(\"WScript.Shell\")\r\n"
+        "sh.Run \"powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass \" & _\r\n"
+        "       \"-WindowStyle Hidden -File \"\"%s\"\"\", 0, False\r\n" % quoted
+    )
+    with open(target, "w", encoding="ascii", newline="") as fh:
+        fh.write(body)
+    legacy = autostart_path(".cmd")
+    if os.path.isfile(legacy):
+        try:
+            os.remove(legacy)
+        except OSError:
+            pass
+    return target
+
+
+def remove_autostart() -> None:
+    for ext in (".vbs", ".cmd"):
+        path = autostart_path(ext)
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+# The installer prints one "== Step ..." banner per phase. Mapping those to a
+# percentage makes the bar report real work instead of spinning: the first
+# upload alone is ~30 MB and takes minutes, which otherwise looks like a hang.
+INSTALL_STEPS = (
+    ("checking local prerequisites", 6, "检查本机组件"),
+    ("creating dedicated keys", 14, "生成专用密钥"),
+    ("installing public keys", 26, "安装公钥到 Linux"),
+    ("uploading the delivery folder", 42, "上传交付目录（首次约 30 MB）"),
+    ("sharing the agent token", 74, "共享代理令牌"),
+    ("saving local settings", 80, "写入本机设置"),
+    ("registering autostart", 86, "注册开机自启"),
+    ("stopping any running instance", 90, "停止旧实例"),
+    ("refreshing the local mirror", 94, "同步镜像并启动守护"),
+)
+
+
+def step_progress(line: str):
+    """Maps one installer output line to (percent, phase) or (None, None)."""
+    text = line.strip()
+    if not text.startswith("=="):
+        return None, None
+    body = text[2:].strip().lower()
+    for marker, pct, phase in INSTALL_STEPS:
+        if body.startswith(marker):
+            return pct, phase
+    return None, None
+
+
+def run_ps_stream(script: str, args=None, on_line=None, timeout: int = 1800,
+                  env=None) -> int:
+    """Runs a PowerShell script and hands over each line as it appears.
+
+    No console window is ever shown (CREATE_NO_WINDOW), and nothing is buffered
+    until exit: the user watches the real output in the window instead of a
+    frozen progress bar. Returns the exit code, or -1 on timeout / start failure.
+    """
+    argv = ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", script]
+    if args:
+        argv += list(args)
+    full_env = os.environ.copy()
+    full_env["PYTHONIOENCODING"] = "utf-8"
+    if env:
+        full_env.update(env)
+
+    def say(text: str) -> None:
+        if on_line:
+            on_line(text)
+
+    try:
+        proc = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, env=full_env, cwd=SCRIPT_DIR,
+            creationflags=_creationflags(),
+        )
+    except Exception as exc:
+        say("无法运行 PowerShell: %s" % exc)
+        return -1
+
+    expired = threading.Event()
+
+    def killer():
+        expired.set()
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    guard = threading.Timer(timeout, killer)
+    guard.daemon = True
+    guard.start()
+    try:
+        for raw in iter(proc.stdout.readline, b""):
+            say(decode(raw).rstrip("\r\n"))
+        rc = proc.wait()
+    finally:
+        guard.cancel()
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+    if expired.is_set():
+        say("命令超时（%ss），已终止" % timeout)
+        return -1
+    return rc
+
+
+
 def processes_with(text: str) -> list:
     """Finds processes whose command line contains `text` (see trap D-017)."""
     needle = text.replace("'", "''")
@@ -295,6 +434,120 @@ def probe_host_key(host: str, user: str, port: int) -> str:
 # --------------------------------------------------------------------------- #
 # the window
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# live log follower
+#
+# The daemon runs with no console at all, so its output has to reach this
+# window. Reading the files on a timer would be polling; this blocks inside
+# ReadDirectoryChangesW and is woken by the file system the moment a log grows.
+# --------------------------------------------------------------------------- #
+class LogFollower(threading.Thread):
+    """Streams appended bytes from a set of log files into a callback."""
+
+    def __init__(self, directory: str, names, on_line, max_line: int = 4000):
+        super().__init__(name="log-follow", daemon=True)
+        self.directory = directory
+        self.names = list(names)
+        self.on_line = on_line
+        self.max_line = max_line
+        self._stop = threading.Event()
+        self._offsets = {}
+        self._partial = {}
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        self._prime()
+        while not self._stop.is_set():
+            self._wait_for_change()
+            self._drain()
+
+    def _path(self, name: str) -> str:
+        return os.path.join(self.directory, name)
+
+    def _prime(self) -> None:
+        """Shows what is already there, without replaying the whole history."""
+        for name in self.names:
+            path = self._path(name)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                self._offsets[name] = 0
+                continue
+            start = max(0, size - 6000)
+            self._offsets[name] = start
+            self._read(name, start)
+
+    def _drain(self) -> None:
+        for name in self.names:
+            try:
+                size = os.path.getsize(self._path(name))
+            except OSError:
+                self._offsets[name] = 0
+                continue
+            if size < self._offsets.get(name, 0):
+                self._offsets[name] = 0  # rotated or truncated
+            self._read(name, self._offsets.get(name, 0))
+
+    def _read(self, name: str, start: int) -> None:
+        try:
+            with open(self._path(name), "rb") as fh:
+                fh.seek(start)
+                raw = fh.read()
+                self._offsets[name] = fh.tell()
+        except OSError:
+            return
+        if not raw:
+            return
+        pending = self._partial.get(name, "") + decode(raw)
+        lines = pending.split("\n")
+        self._partial[name] = lines.pop() if lines else ""
+        label = os.path.splitext(name)[0]
+        for line in lines:
+            line = line.rstrip("\r")
+            if line.strip():
+                self.on_line("[%s] %s" % (label, line[: self.max_line]))
+
+    def _wait_for_change(self) -> None:
+        """Blocks until the directory changes; returns on stop or every 2 s."""
+        kernel32 = ctypes.windll.kernel32
+        FILE_LIST_DIRECTORY = 0x0001
+        FILE_SHARE_ALL = 0x00000007
+        OPEN_EXISTING = 3
+        FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+        handle = kernel32.CreateFileW(
+            self.directory, FILE_LIST_DIRECTORY, FILE_SHARE_ALL, None,
+            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, None,
+        )
+        if handle in (0, -1, ctypes.c_void_p(-1).value):
+            # No notifications available (unusual permission): very slow re-read
+            # so the pane still fills in, never a busy loop.
+            self._stop.wait(1.0)
+            return
+        try:
+            buf = ctypes.create_string_buffer(16 * 1024)
+            FILE_NOTIFY_CHANGE_SIZE = 0x00000008
+            FILE_NOTIFY_CHANGE_LAST_WRITE = 0x00000010
+            FILE_NOTIFY_CHANGE_FILE_NAME = 0x00000001
+            flags = (FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE
+                     | FILE_NOTIFY_CHANGE_FILE_NAME)
+            returned = ctypes.c_ulong(0)
+            ok = kernel32.ReadDirectoryChangesW(
+                handle, buf, len(buf), False, flags,
+                ctypes.byref(returned), None, None,
+            )
+            if not ok:
+                self._stop.wait(0.5)
+        except Exception:
+            self._stop.wait(0.5)
+        finally:
+            try:
+                kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -329,6 +582,7 @@ class WinBridgeApp(tk.Tk):
 
         self._build_ui()
         self._load_saved_password()
+        self._start_log_follower()
         self.after(150, self._drain)
         self.after(300, self.refresh_status)
         self.after(600, self._announce_layout)
@@ -460,9 +714,20 @@ class WinBridgeApp(tk.Tk):
         wrap.pack(fill="both", expand=True)
         bar = ttk.Frame(wrap)
         bar.pack(fill="x")
-        ttk.Label(bar, text="输出").pack(side="left")
+        ttk.Label(bar, text="输出（实时）").pack(side="left")
         ttk.Button(bar, text="复制", command=self._copy_log).pack(side="right")
         ttk.Button(bar, text="清空", command=lambda: self._set_log("")).pack(side="right", padx=6)
+
+        self.phase_var = tk.StringVar(value="就绪")
+        self.pct_var = tk.StringVar(value="")
+        prog = ttk.Frame(wrap)
+        prog.pack(fill="x", pady=(6, 2))
+        ttk.Label(prog, textvariable=self.phase_var).pack(side="left")
+        ttk.Label(prog, textvariable=self.pct_var, width=6, anchor="e").pack(side="right")
+        self.progress = ttk.Progressbar(wrap, orient="horizontal", mode="determinate",
+                                        maximum=100, value=0)
+        self.progress.pack(fill="x", pady=(0, 6))
+
         self.log = tk.Text(wrap, height=12, wrap="none", font=("Consolas", 9),
                            bg="#0f1115", fg="#d7dde5", insertbackground="#d7dde5")
         scroll = ttk.Scrollbar(wrap, orient="vertical", command=self.log.yview)
@@ -473,6 +738,54 @@ class WinBridgeApp(tk.Tk):
         self.log.tag_configure("ok", foreground="#7ee787")
         self.log.tag_configure("cmd", foreground="#79c0ff")
         self.log.tag_configure("dim", foreground="#8b949e")
+
+    # -- progress --------------------------------------------------------- #
+    def set_progress(self, pct, phase=None) -> None:
+        """Any thread may report progress; the drain applies it on the UI thread."""
+        self.msgs.put(("progress", (pct, phase)))
+
+    def _apply_progress(self, pct, phase) -> None:
+        if phase is not None:
+            self.phase_var.set(phase)
+        if pct is None:
+            return
+        self.progress.configure(mode="determinate")
+        self.progress["value"] = max(0, min(100, int(pct)))
+        self.pct_var.set("%d%%" % int(pct))
+
+    def _install_line(self, line: str) -> None:
+        """Live output handler for install / update / verify."""
+        if not line.strip():
+            return
+        pct, phase = step_progress(line)
+        if pct is not None:
+            self.set_progress(pct, phase)
+        if line.startswith("OK"):
+            tag = "ok"
+        elif line.startswith("!!"):
+            tag = "err"
+        elif line.startswith("=="):
+            tag = "cmd"
+        else:
+            tag = ""
+        self.emit(line, tag)
+
+
+    # -- daemon log streaming --------------------------------------------- #
+    def _start_log_follower(self) -> None:
+        """Tails the daemon logs so nothing has to open a console window.
+
+        gui.log is deliberately excluded: this window writes it itself, so
+        following it would echo every line twice.
+        """
+        os.makedirs(LOG_DIR, exist_ok=True)
+        self.follower = LogFollower(
+            LOG_DIR,
+            ("supervisor.log", "tunnel.log", "agent.log",
+             "agent-stdout.log", "agent-stderr.log"),
+            lambda line: self.emit(line, "dim"),
+        )
+        self.follower.start()
 
     # -- log plumbing ----------------------------------------------------- #
     def _set_log(self, text: str) -> None:
@@ -496,8 +809,8 @@ class WinBridgeApp(tk.Tk):
                     self.log.see("end")
                     self.log.configure(state="disabled")
                     log_line(text)
-                elif kind == "state":
-                    self.msgs.task_done()
+                elif kind == "progress":
+                    self._apply_progress(*payload)
         except queue.Empty:
             pass
         self.after(150, self._drain)
@@ -509,9 +822,8 @@ class WinBridgeApp(tk.Tk):
 
     # -- helpers ---------------------------------------------------------- #
     def _autostart_enabled(self) -> bool:
-        startup = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
-                               "Start Menu", "Programs", "Startup", "WinLinuxBridge.cmd")
-        return os.path.isfile(startup)
+        return (os.path.isfile(autostart_path(".vbs"))
+                or os.path.isfile(autostart_path(".cmd")))
 
     def _load_saved_password(self) -> None:
         if os.path.isfile(CRED_PATH):
@@ -574,14 +886,19 @@ class WinBridgeApp(tk.Tk):
             return
         self._busy(True)
         self.emit("=== %s ===" % label, "cmd")
+        self.set_progress(0, label)
 
         def runner():
+            failed = False
             try:
                 fn()
             except Exception as exc:
+                failed = True
                 self.emit("错误: %s" % exc, "err")
                 log_line(traceback.format_exc())
             finally:
+                if failed:
+                    self.set_progress(None, "已中断")
                 self.msgs.put(("log", ("", "")))
                 self.after(0, lambda: self._busy(False))
                 self.after(200, self.refresh_status)
@@ -606,27 +923,17 @@ class WinBridgeApp(tk.Tk):
 
     def on_toggle_autostart(self) -> None:
         want = self.var["autostart"].get()
-        startup_dir = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
-                                   "Start Menu", "Programs", "Startup")
-        target = os.path.join(startup_dir, "WinLinuxBridge.cmd")
         try:
             if want:
-                os.makedirs(startup_dir, exist_ok=True)
                 local = self.var["local"].get().strip() or DEFAULTS["WL_LOCAL_ROOT"]
-                cmd = os.path.join(local, "win", "start-win.cmd")
                 supervisor = os.path.join(local, "win", "winbridge_supervisor.ps1")
-                clean = supervisor.replace("\r", "").replace("\n", "").strip().strip('"')
-                line = ('start "" /min powershell.exe -NoLogo -NoProfile '
-                        '-ExecutionPolicy Bypass -WindowStyle Hidden -File "%s"' % clean)
-                body = ("@echo off\r\n"
-                        "rem WinLinuxBridge autostart (created by the GUI)\r\n"
-                        + line + "\r\n")
-                with open(target, "w", encoding="ascii", newline="") as fh:
-                    fh.write(body)
-                self.emit("已开启开机自启（登录后自动运行）", "ok")
+                if not os.path.isfile(supervisor):
+                    supervisor = PS_SUPER
+                target = write_autostart_vbs(supervisor)
+                self.emit("已开启开机自启（无窗口，登录后自动运行）", "ok")
+                self.emit(target, "dim")
             else:
-                if os.path.isfile(target):
-                    os.remove(target)
+                remove_autostart()
                 self.emit("已关闭开机自启", "dim")
         except Exception as exc:
             self.emit("切换自启失败: %s" % exc, "err")
@@ -689,7 +996,8 @@ class WinBridgeApp(tk.Tk):
             self.emit("找不到 install-win.ps1，交付目录不完整", "err")
             return
 
-        args = ["-LinuxHost", host, "-LinuxUser", user, "-RemoteRoot", remote]
+        args = ["-LinuxHost", host, "-LinuxUser", user, "-RemoteRoot", remote,
+                "-SshPort", str(port)]
         if fp:
             args += ["-HostKey", fp]
 
@@ -700,10 +1008,12 @@ class WinBridgeApp(tk.Tk):
             env = {"WL_LINUX_PASSWORD": self.var["password"].get()}
             self.emit("开始部署：装密钥 → 上传程序 → 配置令牌 → 注册自启", "cmd")
             self.emit("首次上传包含便携运行时，约 30 MB，请稍候。", "dim")
-            rc, out = run_ps(PS_INSTALL, args, timeout=1800, env=env)
-            for line in out.splitlines():
-                if line.strip():
-                    self.emit(line)
+            rc = run_ps_stream(PS_INSTALL, args, self._install_line,
+                               timeout=1800, env=env)
+            if rc == 0:
+                self.set_progress(100, "部署完成")
+            else:
+                self.set_progress(None, "部署失败")
             if rc == 0:
                 self.emit("部署完成。Linux 上可执行：%s/linux/wl status" % remote, "ok")
             else:
@@ -724,27 +1034,42 @@ class WinBridgeApp(tk.Tk):
         def job():
             write_conf(self.collect_conf())
             self.emit("重新上传程序文件并刷新 Linux 侧脚本（不动密钥与令牌）", "cmd")
-            rc, out = run_ps(PS_INSTALL, ["-LinuxHost", host, "-LinuxUser", user,
-                                          "-RemoteRoot", remote, "-SkipKeys"], timeout=1200)
-            for line in out.splitlines():
-                if line.strip():
-                    self.emit(line)
+            rc = run_ps_stream(
+                PS_INSTALL,
+                ["-LinuxHost", host, "-LinuxUser", user, "-RemoteRoot", remote,
+                 "-SkipKeys"],
+                self._install_line, timeout=1200)
+            self.set_progress(100 if rc == 0 else None, "完成" if rc == 0 else "失败")
             self.emit("完成（rc=%d）" % rc, "ok" if rc == 0 else "err")
 
         self._worker("更新程序", job)
 
     def on_start(self) -> None:
-        local = self.var["local"].get().strip() or DEFAULTS["WL_LOCAL_ROOT"]
-        cmd = os.path.join(local, "win", "start-win.cmd")
-        if not os.path.isfile(cmd):
-            cmd = CMD_START
-        if not os.path.isfile(cmd):
-            self.emit("找不到 start-win.cmd，请先执行「安装并启动」", "err")
+        """Starts the supervisor with no console window at all.
+
+        CREATE_NO_WINDOW means there is no window to flash or minimise, and
+        DETACHED_PROCESS means closing this panel does not take the daemon down.
+        Its output is written to the logs folder under the user profile and`n        streamed back in here by LogFollower, so nothing is printed outside this`n        window.
+        """
+        conf = self.collect_conf()
+        local = conf.get("WL_LOCAL_ROOT") or DEFAULTS["WL_LOCAL_ROOT"]
+        supervisor = os.path.join(local, "win", "winbridge_supervisor.ps1")
+        if not os.path.isfile(supervisor):
+            supervisor = PS_SUPER
+        if not os.path.isfile(supervisor):
+            self.emit("找不到 winbridge_supervisor.ps1，请先执行「安装并启动」", "err")
             return
+        argv = ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-WindowStyle", "Hidden", "-File", supervisor]
         try:
-            subprocess.Popen([cmd], cwd=os.path.dirname(cmd),
-                             creationflags=0x08000000 | 0x00000008)
-            self.emit("已请求启动后台守护（约 10 秒后就绪）", "ok")
+            subprocess.Popen(
+                argv, cwd=os.path.dirname(supervisor),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=0x08000000 | 0x00000008,
+            )
+            self.emit("已启动后台守护（无窗口，约 10 秒后就绪）", "ok")
+            self.emit("守护日志会实时出现在这里（logs\\supervisor.log 等）", "dim")
         except Exception as exc:
             self.emit("启动失败: %s" % exc, "err")
         self.after(8000, self.refresh_status)
@@ -849,12 +1174,16 @@ class WinBridgeApp(tk.Tk):
 
         def job():
             self.emit("运行自检（不需要隧道）...", "cmd")
-            rc, out = run_ps(script, timeout=600)
-            for line in out.splitlines():
-                if not line.strip():
-                    continue
-                tag = "ok" if line.startswith("[PASS]") else ("err" if line.startswith("[FAIL]") else "")
-                self.emit(line, tag)
+            def on_line(text: str) -> None:
+                if not text.strip():
+                    return
+                tag = "ok" if text.startswith("[PASS]") else (
+                    "err" if text.startswith("[FAIL]") else "")
+                self.emit(text, tag)
+
+            rc = run_ps_stream(script, None, on_line, timeout=600)
+            self.set_progress(100 if rc == 0 else None,
+                              "自检完成" if rc == 0 else "自检有失败项")
             self.emit("自检结束 rc=%d" % rc, "ok" if rc == 0 else "err")
 
         self._worker("自检", job)
