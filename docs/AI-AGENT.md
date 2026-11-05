@@ -144,6 +144,9 @@ wl shot /tmp/after.png    # 每步之后截图确认
 相对路径基于 Windows 的 `%USERPROFILE%\WinLinuxBridge`；绝对路径只能在
 `%USERPROFILE%` 之内，越界返回 403。
 
+单文件上限 64 MB。`wl put` 在本地先检查大小，`wl get` 的父目录不存在会自动创建。
+退出码：`0` 成功，`2` 代理拒绝或本地写入失败，`7` 隧道不可达，`1` 本地前置条件不满足。
+
 ## 8. 访问 Windows 本机接口
 
 ```bash

@@ -204,6 +204,16 @@ wl lanes                       三车道结构
 路径规则：`ls/get/put/rm` 的相对路径基于 Windows 的
 `%USERPROFILE%\WinLinuxBridge`；绝对路径必须落在 `%USERPROFILE%` 内，否则返回 403。
 
+文件传输要点：
+
+- 单文件上限 64 MB（代理的 `MAX_FILE`）。超过时 `wl put` 在本地就报错退出，不发送请求。
+- 请求体走 `curl` 的 stdin（`--data-binary @-`），不再作为命令行参数，所以文件大小
+  只受上面的 64 MB 限制，与 shell 的 `MAX_ARG_STRLEN`（约 128 KB）无关。
+- `wl get <win 路径>` 省略本地名时取 Windows 路径的文件名（`C:\a\b.txt` → `b.txt`）；
+  目标父目录不存在会自动创建；目标若是目录则报错退出。
+- 退出码：`0` 成功，`2` 代理拒绝（403/404/400）或本地写入失败，`7` 隧道不可达，
+  `1` 本地前置条件不满足（源文件不存在、超过 64 MB、目标是目录）。
+
 ### 任务管理
 
 ```powershell

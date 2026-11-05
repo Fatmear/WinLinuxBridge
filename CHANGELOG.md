@@ -31,13 +31,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Server-side execution, cancel and wait deadlines use a monotonic clock, so an NTP
   or manual wall-clock change can neither cut a healthy job short nor extend a
   timeout.
+- `wl put` sends the request body on stdin instead of as a curl argument. The old
+  form hit `MAX_ARG_STRLEN` and made uploads past roughly 24 KB fail with
+  "Argument list too long", which the wrapper reported as "cannot reach the Windows
+  side"; uploads now reach the agent's 64 MB limit.
+- `wl put` refuses local files above 64 MB before sending, and `wl put`/`wl rm`
+  turn an agent error envelope into exit code 2 instead of exiting 0.
+- `wl get` creates missing parent directories, refuses a directory target, and
+  reports local write failures instead of a bare traceback. Downloads land via a
+  temporary `.wl-part` file, so an interrupted transfer leaves no half file.
+- `wl get`/`wl put` default the output name correctly for Windows source paths
+  (`C:\a\b.txt` now yields `b.txt`).
+- `wl` strips CR from `config/bridge.env` when sourcing it, so a hand-copied CRLF
+  config no longer makes every request fail with "URL rejected".
+- Usage mistakes in `wl` exit 2, matching the documented client exit codes.
 
 ### Verification
 
 - `python tools/test_bridge_jobs.py -v`: 26 offline regressions plus real Windows
   process checks for literal arguments, exit codes and persisted capture-limit flags.
-- The clock regressions were mutation-checked against the previous implementation and
-  fail there, so they guard the fix rather than the code shape.
+- `python tools/test_wl_cli.py -v`: 16 regressions that drive the real `linux/wl`
+  against a stand-in agent, including a 5 MB upload, the 64 MB refusal, 403/404
+  propagation and download path handling.
+- The clock and file-transfer regressions were mutation-checked against the previous
+  implementations and fail there, so they guard the fixes rather than the code shape.
 - Scope: bridge execution/client only; no CSI capture tools, firmware or GUI changes.
   Physical serial disconnection and the live Linux tunnel still require field checks.
 

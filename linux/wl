@@ -18,8 +18,11 @@ ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 ENV_FILE="$ROOT/config/bridge.env"
 
 if [ -f "$ENV_FILE" ]; then
+    # A bridge.env that travelled through Windows has CRLF, and then PORT keeps
+    # a trailing \r: every request dies with "URL rejected: Malformed input".
+    # install-win.ps1 already rewrites the file as LF; this covers hand copies.
     # shellcheck disable=SC1090
-    . "$ENV_FILE"
+    . <(tr -d '\r' <"$ENV_FILE")
 fi
 
 PORT="${WL_AGENT_PORT:-18080}"
@@ -33,6 +36,7 @@ export WL_WAIT_MARGIN="${WL_WAIT_MARGIN:-30}"
 JOB_CLIENT="$ROOT/linux/wl_job.py"
 
 die() { printf 'wl: %s\n' "$*" >&2; exit 1; }
+usage_die() { printf 'wl: usage: wl %s\n' "$*" >&2; exit 2; }
 
 need_token() {
     [ -n "$TOKEN" ] || die "no token in $ENV_FILE - run install-win.ps1 on the Windows side"
@@ -41,11 +45,24 @@ need_token() {
 api() { # api METHOD PATH [JSON_BODY]
     local method="$1" path="$2" body="${3:-}"
     local -a args=(-sS -m "$TIMEOUT" -X "$method" -H "Authorization: Bearer ${TOKEN}")
+    # The body goes in on stdin. As an argv word it is capped by the kernel
+    # (MAX_ARG_STRLEN, ~128 KB on Linux, less under cygwin), so a few KB of
+    # file content made exec fail with "Argument list too long" and curl
+    # never ran - which looked like the Windows side being down.
+    local rc=0
     if [ -n "$body" ]; then
-        args+=(-H 'Content-Type: application/json; charset=utf-8' --data-binary "$body")
+        args+=(-H 'Content-Type: application/json; charset=utf-8' --data-binary @-)
+        printf '%s' "$body" | curl "${args[@]}" "${BASE}${path}"
+        rc=$?
+    else
+        curl "${args[@]}" "${BASE}${path}"
+        rc=$?
     fi
-    if ! curl "${args[@]}" "${BASE}${path}"; then
+    if [ "$rc" -eq 7 ]; then
         printf '\nwl: cannot reach %s - is the Windows side running? try: wl status\n' "$BASE" >&2
+        return 7
+    elif [ "$rc" -ne 0 ]; then
+        printf '\nwl: request to %s failed (curl exit %s)\n' "${BASE}${path}" "$rc" >&2
         return 7
     fi
 }
@@ -74,6 +91,40 @@ sys.exit(0 if rc == 0 else (rc & 0xFF) or 1)
 }
 
 pretty() { python3 -m json.tool --no-ensure-ascii 2>/dev/null || cat; }
+
+# basename that also splits Windows paths ("C:\a\b.txt" -> "b.txt").
+base_name() {
+    local p="${1//\\//}"
+    p="${p%/}"
+    printf '%s' "${p##*/}"
+}
+
+# Reads the answer to a /fs request: one confirmation line, or exit 2 when the
+# agent reported an error. Callers check the curl status separately (PIPESTATUS).
+fs_ack() {
+    python3 -c '
+import json, sys
+raw = sys.stdin.read()
+if not raw.strip():
+    sys.exit(125)
+try:
+    d = json.loads(raw)
+except ValueError:
+    sys.stderr.write("wl: unexpected answer from the agent: %s\n" % raw.strip()[:200])
+    sys.exit(125)
+if not isinstance(d, dict):
+    sys.stderr.write("wl: unexpected answer from the agent\n")
+    sys.exit(125)
+if d.get("error"):
+    sys.stderr.write("wl: %s: %s\n" % (d["error"], d.get("detail", "")))
+    sys.exit(2)
+if not d.get("ok", True):
+    sys.stderr.write("wl: the agent did not confirm the request\n")
+    sys.exit(2)
+size = d.get("size")
+print("%s (%d bytes)" % (d["path"], size) if size is not None else d.get("path"))
+'
+}
 
 usage() {
     cat <<'EOF'
@@ -164,7 +215,7 @@ run)
 job)
     need_token
     [ -f "$JOB_CLIENT" ] || die "job: missing $JOB_CLIENT (delivery folder is incomplete)"
-    [ $# -gt 0 ] || die "usage: wl job start|status|logs|result|cancel|list ..."
+    [ $# -gt 0 ] || usage_die "job start|status|logs|result|cancel|list ..."
     sub="$1"; shift
     case "$sub" in
     start) exec python3 "$JOB_CLIENT" run "$@" ;;
@@ -192,7 +243,7 @@ for w in d.get("windows", []):
 
 focus)
     need_token
-    [ $# -ge 1 ] || die "usage: wl focus <window title part>"
+    [ $# -ge 1 ] || usage_die "focus <window title part>"
     body=$(python3 -c 'import json,sys;print(json.dumps({"action":"focus","title":" ".join(sys.argv[1:])}))' -- "$@")
     api POST /window "$body"
     echo
@@ -220,7 +271,7 @@ print("%s  (%d bytes, from %s)" % (sys.argv[1], d.get("size", 0), d.get("path"))
 
 click)
     need_token
-    [ $# -ge 2 ] || die "usage: wl click <x> <y> [--double|--right|--middle]"
+    [ $# -ge 2 ] || usage_die "click <x> <y> [--double|--right|--middle]"
     action=click
     for a in "$@"; do
         case "$a" in
@@ -243,7 +294,7 @@ move)
 
 type)
     need_token
-    [ $# -ge 1 ] || die "usage: wl type <text>"
+    [ $# -ge 1 ] || usage_die "type <text>"
     body=$(python3 -c 'import json,sys;print(json.dumps({"action":"type","text":" ".join(sys.argv[1:])}))' -- "$@")
     api POST /input "$body"
     echo
@@ -251,7 +302,7 @@ type)
 
 key)
     need_token
-    [ $# -ge 1 ] || die "usage: wl key <combo>   e.g. wl key CTRL+S"
+    [ $# -ge 1 ] || usage_die "key <combo>   e.g. wl key CTRL+S"
     body=$(python3 -c 'import json,sys;print(json.dumps({"action":"key","key":sys.argv[1]}))' "$1")
     api POST /input "$body"
     echo
@@ -271,7 +322,7 @@ paste)
 
 start)
     need_token
-    [ $# -ge 1 ] || die "usage: wl start <path|url>"
+    [ $# -ge 1 ] || usage_die "start <path|url>"
     body=$(python3 -c 'import json,sys;print(json.dumps({"shell":"cmd","cmd":"start \"\" \"" + sys.argv[1] + "\""}))' "$1")
     api POST /run "$body" | show_run
     ;;
@@ -287,7 +338,7 @@ http)
         *) url="$1"; shift ;;
         esac
     done
-    [ -n "$url" ] || die "usage: wl http <url> [-X METHOD] [-d BODY] [-H 'K: V']"
+    [ -n "$url" ] || usage_die "http <url> [-X METHOD] [-d BODY] [-H 'K: V']"
     body=$(python3 - "$url" "$method" "$data" "${hdrs[@]:-}" <<'PY'
 import json, sys
 url, method, data = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -323,7 +374,10 @@ ls)
     need_token
     path="${1:-.}"
     body=$(python3 -c 'import json,sys;print(json.dumps({"op":"list","path":sys.argv[1]}))' "$path")
-    api POST /fs "$body" | python3 -c '
+    answer=$(api POST /fs "$body")
+    rc=$?
+    [ "$rc" -eq 0 ] || exit "$rc"
+    printf '%s' "$answer" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 if "error" in d:
@@ -338,12 +392,28 @@ for e in d["entries"]:
 
 get)
     need_token
-    [ $# -ge 1 ] || die "usage: wl get <win path> [local out]"
-    src="$1"; out="${2:-$(basename "$1")}"
+    [ $# -ge 1 ] || usage_die "get <win path> [local out]"
+    src="$1"; out="${2:-$(base_name "$1")}"
+    out_dir="$(dirname "$out")"
+    [ ! -d "$out" ] || die "$out is a directory - name the file to write"
+    [ -d "$out_dir" ] || mkdir -p "$out_dir" || die "cannot create $out_dir"
     body=$(python3 -c 'import json,sys;print(json.dumps({"op":"read","path":sys.argv[1]}))' "$src")
-    api POST /fs "$body" | python3 -c '
-import base64, json, sys
-d = json.load(sys.stdin)
+    # Same ordering as put/rm: curl's own exit status has to be visible, so it
+    # runs outside the pipeline that parses the answer.
+    answer=$(api POST /fs "$body")
+    rc=$?
+    [ "$rc" -eq 0 ] || exit "$rc"
+    printf '%s' "$answer" | python3 -c '
+import base64, json, os, sys
+raw_in = sys.stdin.read()
+try:
+    d = json.loads(raw_in)
+except ValueError:
+    sys.stderr.write("wl: unexpected answer from the agent: %s\n" % raw_in.strip()[:200])
+    sys.exit(125)
+if not isinstance(d, dict):
+    sys.stderr.write("wl: unexpected answer from the agent\n")
+    sys.exit(125)
 if "error" in d:
     sys.stderr.write("wl: %s: %s\n" % (d["error"], d.get("detail", "")))
     sys.exit(2)
@@ -351,30 +421,57 @@ if d.get("b64"):
     raw = base64.b64decode(d["b64"])
 else:
     raw = d.get("text", "").encode("utf-8")
-with open(sys.argv[1], "wb") as fh:
-    fh.write(raw)
-print("%s (%d bytes, from %s)" % (sys.argv[1], len(raw), d.get("path")))
+# Write beside the target and rename, so an interrupted transfer never
+# leaves a half file that looks complete.
+dst = sys.argv[1]
+tmp = dst + ".wl-part"
+try:
+    with open(tmp, "wb") as fh:
+        fh.write(raw)
+    os.replace(tmp, dst)
+except OSError as exc:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    sys.stderr.write("wl: cannot write %s: %s\n" % (dst, exc.strerror or exc))
+    sys.exit(2)
+print("%s (%d bytes, from %s)" % (dst, len(raw), d.get("path")))
 ' "$out"
     ;;
 
 put)
     need_token
-    [ $# -ge 1 ] || die "usage: wl put <local file> [win path]"
-    local_file="$1"; dst="${2:-$(basename "$1")}"
+    [ $# -ge 1 ] || usage_die "put <local file> [win path]"
+    local_file="$1"; dst="${2:-$(base_name "$1")}"
     [ -f "$local_file" ] || die "no such file: $local_file"
+    # The agent refuses bodies over 64 MB; fail here with a clear message
+    # instead of shipping 85 MB of base64 that it will only throw away.
+    size=$(wc -c <"$local_file")
+    if [ "$size" -gt 67108864 ]; then
+        die "$local_file is $size bytes - the limit for wl put is 67108864 bytes"
+    fi
     body=$(python3 - "$local_file" "$dst" <<'PY'
 import base64, json, sys
 with open(sys.argv[1], "rb") as fh:
     raw = fh.read()
-print(json.dumps({"op": "write", "path": sys.argv[2], "b64": base64.b64encode(raw).decode("ascii")}))
+print(json.dumps({"op": "write", "path": sys.argv[2],
+                  "b64": base64.b64encode(raw).decode("ascii")}))
 PY
 )
-    api POST /fs "$body" | pretty
+    # Run curl first and only then read its answer: a pipeline would hand the
+    # exit status to the last command, and curl's own failure (7 = no tunnel,
+    # 126 = exec failed) would be replaced by the parse error that follows.
+    answer=$(api POST /fs "$body")
+    rc=$?
+    [ "$rc" -eq 0 ] || exit "$rc"
+    printf '%s' "$answer" | fs_ack
+    exit "${PIPESTATUS[1]}"
     ;;
 
 rm)
     need_token
-    [ $# -ge 1 ] || die "usage: wl rm <win path> [--dir]"
+    [ $# -ge 1 ] || usage_die "rm <win path> [--dir]"
     rec=false; p=""
     for a in "$@"; do
         case "$a" in
@@ -383,7 +480,11 @@ rm)
         esac
     done
     body=$(python3 -c 'import json,sys;print(json.dumps({"op":"rm","path":sys.argv[1],"recursive":sys.argv[2]=="1"}))' "$p" "$([ "$rec" = true ] && echo 1 || echo 0)")
-    api POST /fs "$body" | pretty
+    answer=$(api POST /fs "$body")
+    rc=$?
+    [ "$rc" -eq 0 ] || exit "$rc"
+    printf '%s' "$answer" | fs_ack
+    exit "${PIPESTATUS[1]}"
     ;;
 
 lanes)
