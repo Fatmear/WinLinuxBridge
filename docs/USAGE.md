@@ -135,7 +135,7 @@ wl run [--shell auto|powershell|cmd|none] [--timeout S] [--wait S]
        [--no-wait] [--cwd P] [--env K=V] [--exe PROG] -- <命令或参数...>
 
 wl job start  <同上>            # 只启动，立即返回 job id
-wl job status <id> [--wait S]    # 排队/运行/终态
+wl job status <id> [--wait S]    # 排队/运行/终态；--wait 超预算返回 124
 wl job logs   <id> --since N [--stream stderr] [-f] [--json]
 wl job result <id> [--output summary|json|text]
 wl job cancel <id>              # 只杀该任务的进程树

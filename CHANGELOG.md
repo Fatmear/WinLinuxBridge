@@ -6,6 +6,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- Bridge clients reject error/non-object envelopes and missing job identities instead
+  of reporting successful submission; JSON output remains JSON on transport errors.
+- Client wait budgets include submission time and bound status polls using a
+  monotonic clock. Batch disconnects retain the submitted job id for recovery.
+- `wl job result` propagates task failure/cancellation/startup errors; unfinished
+  results and batches return 124, and batch transport failures return 125.
+- Shell-free execution preserves structured argument boundaries; legacy Windows
+  command-line strings are passed directly to CreateProcess instead of POSIX shlex.
+- Outputs between the head size and head-plus-tail size are no longer omitted.
+  Capture caps are reapplied after further writes and before final metadata is saved.
+- Results distinguish summary omission from actual disk-capture loss through
+  `capture_truncated`, preserve this information on restart, and warn on stderr.
+- Capture-limit truncation reuses the child's own write handle and seeks back to the
+  new end, so a concurrent reader never sees NUL padding or a file several times
+  larger than the cap.
+- `wl job status --wait` reports an expired budget as 124 with an explicit
+  "state is unknown" message while a plain query stays 0; `wl job logs` exposes a
+  `reset` flag and warns when the cursor falls past the file end.
+- Server-side execution, cancel and wait deadlines use a monotonic clock, so an NTP
+  or manual wall-clock change can neither cut a healthy job short nor extend a
+  timeout.
+
+### Verification
+
+- `python tools/test_bridge_jobs.py -v`: 26 offline regressions plus real Windows
+  process checks for literal arguments, exit codes and persisted capture-limit flags.
+- The clock regressions were mutation-checked against the previous implementation and
+  fail there, so they guard the fix rather than the code shape.
+- Scope: bridge execution/client only; no CSI capture tools, firmware or GUI changes.
+  Physical serial disconnection and the live Linux tunnel still require field checks.
+
 ## [1.4.0] - 2026-11-01
 
 Event-driven execution, observable deployment and windowless background operation.

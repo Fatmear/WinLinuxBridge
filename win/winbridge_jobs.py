@@ -128,6 +128,16 @@ def now_ms() -> float:
     return time.perf_counter() * 1000.0
 
 
+def mono() -> float:
+    """Monotonic seconds. Every deadline uses this, never the wall clock.
+
+    The wall clock may jump forward (NTP sync, manual change) and end a healthy
+    job early, or jump back and let a runaway job outlive its timeout. Durations
+    must therefore never be measured against it; only timestamps (`now_iso`) may.
+    """
+    return time.monotonic()
+
+
 def decode_bytes(raw: bytes) -> str:
     """Decode subprocess output without ever raising (D-009)."""
     for enc in ("utf-8-sig", "utf-8", "cp936", "mbcs"):
@@ -218,9 +228,12 @@ class _Capture:
             pass
 
     def enforce_cap(self) -> None:
-        """Truncates in place once the file grew past the cap."""
-        if self.truncated:
-            return
+        """Truncates in place once the file grew past the cap.
+
+        The write handle is shared with the child, so after shrinking the file it
+        has to be moved to the new end: an offset left past EOF would make the
+        next write pad the gap with NUL bytes.
+        """
         try:
             size = os.path.getsize(self.path)
         except OSError:
@@ -229,10 +242,10 @@ class _Capture:
             return
         try:
             self.flush()
-            with open(self.path, "r+b") as fh:
-                fh.truncate(self.limit)
+            self._fh.truncate(self.limit)
+            self._fh.seek(0, os.SEEK_END)
             self.truncated = True
-        except OSError:
+        except (OSError, ValueError):
             pass
 
     def close(self) -> None:
@@ -275,9 +288,8 @@ def build_argv(payload: dict, temp_dir: str) -> tuple:
         shell = "powershell"
 
     if shell == "none":
-        import shlex
-
-        return shlex.split(script, posix=False), None, "none"
+        # Popen passes a string directly to CreateProcess on Windows.
+        return script, None, "none"
 
     if shell in ("powershell", "pwsh"):
         exe_name = "pwsh" if shell == "pwsh" else "powershell"
@@ -629,7 +641,7 @@ class JobManager:
         return info
 
     # -- execution --------------------------------------------------------- #
-    def _run_job(self, job_id: str, argv: list, cwd: str, env: dict,
+    def _run_job(self, job_id: str, argv: list | str, cwd: str, env: dict,
                  timeout: float, resource: str, temp_path: str, payload: dict) -> None:
         out_cap = _Capture(self._stdout_path(job_id))
         err_cap = _Capture(self._stderr_path(job_id))
@@ -695,7 +707,7 @@ class JobManager:
             self._patch(job_id, pid=proc.pid, last_activity=now_iso())
 
             stop = self._stop_flags.get(job_id)
-            deadline = time.time() + timeout
+            deadline = mono() + timeout
             run_started = now_ms()
 
             # Event driven instead of "sleep 150 ms and poll": the watcher thread
@@ -713,9 +725,9 @@ class JobManager:
             threading.Thread(target=_watch, name="job-watch-" + job_id,
                              daemon=True).start()
 
-            next_beat = time.time() + HEARTBEAT_S
+            next_beat = mono() + HEARTBEAT_S
             while not done.is_set():
-                wait_for = min(HEARTBEAT_S, max(0.0, deadline - time.time()))
+                wait_for = min(HEARTBEAT_S, max(0.0, deadline - mono()))
                 done.wait(wait_for)
                 if done.is_set():
                     break
@@ -731,7 +743,7 @@ class JobManager:
                                  detail="cancelled on request", out=out_cap, err=err_cap,
                                  extra={"cancel_cleanup": cleanup})
                     return
-                if time.time() >= deadline:
+                if mono() >= deadline:
                     killed = self._kill_tree(proc.pid)
                     try:
                         proc.wait(timeout=10)
@@ -748,10 +760,10 @@ class JobManager:
                     return
                 out_cap.enforce_cap()
                 err_cap.enforce_cap()
-                if time.time() >= next_beat:
+                if mono() >= next_beat:
                     # Heartbeat: memory only. The flusher merges it to disk.
                     self._patch(job_id, last_activity=now_iso())
-                    next_beat = time.time() + HEARTBEAT_S
+                    next_beat = mono() + HEARTBEAT_S
 
             t_exit = now_ms()
             self._timing(job_id, "process_run_ms", t_exit - run_started)
@@ -794,8 +806,10 @@ class JobManager:
                 extra: dict = None, detect_from: float = None) -> None:
         if out is not None:
             out.flush()
+            out.enforce_cap()
         if err is not None:
             err.flush()
+            err.enforce_cap()
         stdout_path = self._stdout_path(job_id)
         stderr_path = self._stderr_path(job_id)
         t0 = now_ms()
@@ -895,10 +909,10 @@ class JobManager:
         killed = self._kill_tree(pid) if pid else 0
         # The runner wakes us through the condition variable the instant it
         # records the final state; no fixed-interval sleeping.
-        deadline = time.time() + 5.0
+        deadline = mono() + 5.0
         with self._cond:
             while (self._meta.get(job_id) or {}).get("state") not in TERMINAL_STATES:
-                remaining = deadline - time.time()
+                remaining = deadline - mono()
                 if remaining <= 0:
                     break
                 self._cond.wait(remaining)
@@ -954,7 +968,7 @@ class JobManager:
         wait is capped at the client's own budget.
         """
         window = max(0.0, min(float(wait or 0), 120.0))
-        deadline = time.time() + window
+        deadline = mono() + window
         with self._cond:
             meta = self._meta.get(job_id)
             if meta is None:
@@ -964,7 +978,7 @@ class JobManager:
                 self._meta[job_id] = meta
             snapshot = (meta.get("state"), meta.get("last_activity"))
             while meta.get("state") not in TERMINAL_STATES:
-                remaining = deadline - time.time()
+                remaining = deadline - mono()
                 if remaining <= 0:
                     break
                 self._cond.wait(min(remaining, 0.5))
@@ -998,6 +1012,8 @@ class JobManager:
             "finished_at": meta.get("finished_at", ""),
             "last_activity": meta.get("last_activity", ""),
             "timings": meta.get("timings") or {},
+            "stdout_truncated": bool(meta.get("stdout_truncated")),
+            "stderr_truncated": bool(meta.get("stderr_truncated")),
         }
         for key in ("cancel_cleanup", "kill_result", "cancel_note", "note"):
             if meta.get(key):
@@ -1012,7 +1028,7 @@ class JobManager:
         long a *client* is willing to wait; the job keeps running regardless.
         """
         window = max(0.0, min(float(timeout or 0), MAX_TIMEOUT))
-        deadline = time.time() + window
+        deadline = mono() + window
         with self._cond:
             meta = self._meta.get(job_id)
             if meta is None:
@@ -1021,7 +1037,7 @@ class JobManager:
                     raise FileNotFoundError("no such job: %s" % job_id)
                 self._meta[job_id] = meta
             while meta.get("state") not in TERMINAL_STATES:
-                remaining = deadline - time.time()
+                remaining = deadline - mono()
                 if remaining <= 0:
                     break
                 self._cond.wait(remaining)
@@ -1038,8 +1054,11 @@ class JobManager:
         total = _file_bytes(path)
         since = max(0, int(since or 0))
         max_bytes = max(1, min(int(max_bytes or 65536), 4 * 1024 * 1024))
-        if since > total:  # file was rotated or job recreated; restart cleanly
+        if since > total:  # truncated by the capture cap, or the job was recreated
             since = 0
+            reset = True
+        else:
+            reset = False
         raw = b""
         if os.path.isfile(path):
             with open(path, "rb") as fh:
@@ -1049,6 +1068,7 @@ class JobManager:
             "job_id": job_id,
             "stream": which,
             "from": since,
+            "reset": reset,
             "next": since + len(raw),
             "bytes_total": total,
             "eof": (since + len(raw)) >= total,
@@ -1061,6 +1081,10 @@ class JobManager:
         info = self.status(job_id, wait=0.0)
         info["stdout"] = _summarize(self._stdout_path(job_id), head, tail)
         info["stderr"] = _summarize(self._stderr_path(job_id), head, tail)
+        for stream in ("stdout", "stderr"):
+            captured = bool(info.get(stream + "_truncated"))
+            info[stream]["capture_truncated"] = captured
+            info[stream]["truncated"] = info[stream]["truncated"] or captured
         timings = dict(info.get("timings") or {})
         timings["result_build_ms"] = round(now_ms() - started, 3)
         info["timings"] = timings
@@ -1130,6 +1154,8 @@ def _summarize(path: str, head: int, tail: int) -> dict:
         if total > head + tail:
             fh.seek(max(0, total - tail))
             tail_bytes = fh.read(tail)
+        else:
+            head_bytes += fh.read(max(0, total - len(head_bytes)))
     omitted = max(0, total - len(head_bytes) - len(tail_bytes))
     if omitted:
         text = (decode_bytes(head_bytes) + "\n...[%d bytes omitted; full output at %s]...\n"

@@ -109,9 +109,15 @@ def api(path: str, payload: dict = None, timeout: float = None) -> dict:
             "The Windows side is down or the tunnel dropped; it self-heals in "
             "10-30 s, or start it with win\\start-gui.cmd." % (PORT, exc))
     try:
-        return json.loads(raw.decode("utf-8"))
-    except Exception as exc:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise TransportError("agent returned invalid JSON: %s" % exc, "AGENT_ERROR")
+    if not isinstance(result, dict):
+        raise TransportError("agent returned a non-object JSON response", "AGENT_ERROR")
+    if "error" in result or result.get("ok") is False or result.get("transport_ok") is False:
+        raise TransportError(str(result.get("detail") or result.get("error")
+                                 or "agent reported failure"), "AGENT_ERROR")
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -140,6 +146,9 @@ def render_result(result: dict, mode: str) -> None:
             "stdout_bytes": stdout.get("bytes"),
             "stderr_bytes": stderr.get("bytes"),
             "stdout_truncated": stdout.get("truncated"),
+            "stderr_truncated": stderr.get("truncated"),
+            "stdout_capture_truncated": stdout.get("capture_truncated", False),
+            "stderr_capture_truncated": stderr.get("capture_truncated", False),
             "stdout_path": stdout.get("path"),
             "stderr_path": stderr.get("path"),
             "stdout_sha256": stdout.get("sha256"),
@@ -162,6 +171,15 @@ def render_result(result: dict, mode: str) -> None:
     detail = result.get("detail") or ""
     if detail:
         sys.stderr.write("[winbridge] %s\n" % detail)
+    for name, stream in (("stdout", stdout), ("stderr", stderr)):
+        if stream.get("capture_truncated"):
+            sys.stderr.write("[winbridge] %s capture truncated: data was discarded; "
+                             "retained output at %s\n" % (name, stream.get("path", "")))
+        elif stream.get("truncated"):
+            sys.stderr.write("[winbridge] %s summary truncated (%s bytes omitted); "
+                             "full output at %s; use wl job logs %s --stream %s\n"
+                             % (name, stream.get("omitted_bytes", 0), stream.get("path", ""),
+                                result.get("job_id", ""), name))
 
 
 def exit_code_for(result: dict) -> int:
@@ -191,23 +209,24 @@ def wait_for(job_id: str, deadline: float, poll: float = None) -> dict:
     waking every 2 s to ask "any news?". Fewer round trips, lower latency.
     """
     window = STATUS_WAIT if poll is None else poll
+    info = {"job_id": job_id, "state": "UNKNOWN"}
     while True:
-        remaining = deadline - time.time()
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return api("/job/status", {"job_id": job_id, "wait": 0})
+            return info
         # Long poll: ask the agent to hold the request until the job changes,
         # but never past our own deadline.
         budget = min(window, remaining)
         try:
             info = api("/job/status",
                        {"job_id": job_id, "wait": budget},
-                       timeout=max(CONNECT_TIMEOUT, budget + 15.0))
+                       timeout=min(remaining, max(CONNECT_TIMEOUT, budget + 15.0)))
         except TransportError:
             # Losing the connection while waiting is not a job failure.
             raise
         if info.get("state") in TERMINAL:
             return info
-        if time.time() >= deadline:
+        if time.monotonic() >= deadline:
             return info
 
 
@@ -246,10 +265,12 @@ def cmd_run(args) -> int:
         if not command:
             sys.stderr.write("wl: run needs a command\n")
             return EXIT_USAGE
-        payload["cmd"] = " ".join(command)
+        payload["cmd"] = (command if args.shell == "none" and len(command) > 1
+                          else " ".join(command))
 
     # Client wait = execution timeout + transfer margin, unless overridden.
     wait_seconds = args.wait if args.wait and args.wait > 0 else (float(args.timeout) + WAIT_MARGIN)
+    deadline = time.monotonic() + wait_seconds
     if not args.no_wait:
         # Ask the agent to hold the start call briefly: a command that finishes
         # inside this window comes back complete, so the whole `wl run` is ONE
@@ -258,10 +279,13 @@ def cmd_run(args) -> int:
 
     try:
         info = api("/job/start", payload,
-                   timeout=max(CONNECT_TIMEOUT, 15.0,
-                               min(START_WAIT, wait_seconds) + 10.0))
+                   timeout=(max(CONNECT_TIMEOUT, 15.0) if args.no_wait else
+                            min(wait_seconds, max(CONNECT_TIMEOUT, 15.0,
+                                                  min(START_WAIT, wait_seconds) + 10.0))))
+        if not isinstance(info.get("job_id"), str) or not info["job_id"]:
+            raise TransportError("agent returned no job_id", "AGENT_ERROR")
     except TransportError as exc:
-        if args.json:
+        if out_mode == "json":
             emit_json({"request_id": request_id, "job_id": None,
                        "transport_ok": False, "state": "UNKNOWN",
                        "error_code": exc.code, "detail": str(exc)})
@@ -274,7 +298,7 @@ def cmd_run(args) -> int:
         sys.stderr.write("[winbridge] request_id already ran; reusing job %s\n" % job_id)
 
     if args.no_wait:
-        if args.json:
+        if out_mode == "json":
             emit_json(info)
         else:
             sys.stdout.write(job_id + "\n")
@@ -285,13 +309,11 @@ def cmd_run(args) -> int:
         render_result(info, out_mode)
         return exit_code_for(info)
 
-    deadline = time.time() + wait_seconds
-
     try:
         info = wait_for(job_id, deadline)
     except TransportError as exc:
         # The job keeps running on Windows. Say so instead of pretending.
-        if args.json:
+        if out_mode == "json":
             emit_json({"request_id": request_id, "job_id": job_id,
                        "transport_ok": False, "state": "UNKNOWN",
                        "error_code": exc.code, "detail": str(exc),
@@ -304,7 +326,7 @@ def cmd_run(args) -> int:
         return EXIT_TRANSPORT
 
     if info.get("state") not in TERMINAL:
-        if args.json:
+        if out_mode == "json":
             emit_json({
                 "request_id": request_id, "job_id": job_id,
                 "transport_ok": True, "state": info.get("state"),
@@ -330,9 +352,15 @@ def cmd_run(args) -> int:
         result = api("/job/result", {"job_id": job_id},
                      timeout=max(CONNECT_TIMEOUT * 4, 30.0))
     except TransportError as exc:
-        sys.stderr.write("wl: job %s finished as %s but the result could not be "
-                         "fetched (%s); retry: wl job result %s\n"
-                         % (job_id, info.get("state"), exc, job_id))
+        detail = ("job %s finished as %s but the result could not be fetched (%s)"
+                  % (job_id, info.get("state"), exc))
+        if out_mode == "json":
+            emit_json({"request_id": request_id, "job_id": job_id,
+                       "transport_ok": False, "state": info.get("state"),
+                       "error_code": exc.code, "detail": detail,
+                       "hint": "wl job result %s" % job_id})
+        else:
+            sys.stderr.write("wl: %s; retry: wl job result %s\n" % (detail, job_id))
         return EXIT_TRANSPORT
 
     result.setdefault("request_id", request_id)
@@ -374,7 +402,7 @@ def cmd_batch(args) -> int:
     wait_seconds = args.wait if args.wait and args.wait > 0 else default_timeout + WAIT_MARGIN
 
     results = []
-    started = time.time()
+    started = time.monotonic()
     for index, step in enumerate(steps):
         name = str(step.get("name") or ("step%d" % index))
         payload = {key: step[key] for key in
@@ -384,12 +412,17 @@ def cmd_batch(args) -> int:
         payload["resource"] = str(step.get("resource") or shared_resource)
         payload["request_id"] = "%s:%s" % (prefix, name)
 
+        job_id = None
+        deadline = time.monotonic() + wait_seconds
         try:
-            info = api("/job/start", payload, timeout=max(CONNECT_TIMEOUT, 15.0))
+            info = api("/job/start", payload,
+                       timeout=min(wait_seconds, max(CONNECT_TIMEOUT, 15.0)))
             job_id = info.get("job_id")
-            final = wait_for(job_id, time.time() + wait_seconds)
+            if not isinstance(job_id, str) or not job_id:
+                raise TransportError("agent returned no job_id", "AGENT_ERROR")
+            final = wait_for(job_id, deadline)
         except TransportError as exc:
-            results.append({"name": name, "job_id": None, "state": "UNKNOWN",
+            results.append({"name": name, "job_id": job_id, "state": "UNKNOWN",
                             "transport_ok": False, "error_code": exc.code,
                             "detail": str(exc)})
             break
@@ -419,10 +452,14 @@ def cmd_batch(args) -> int:
         "transport_ok": all(item.get("transport_ok") for item in results),
         "step_count": len(steps),
         "ran": len(results),
-        "duration_ms": int((time.time() - started) * 1000),
+        "duration_ms": int((time.monotonic() - started) * 1000),
         "steps": results,
     }
     emit_json(summary)
+    if not summary["transport_ok"]:
+        return EXIT_TRANSPORT
+    if any(item.get("state") not in TERMINAL for item in results):
+        return EXIT_WAIT_TIMEOUT
     return EXIT_OK if overall_ok else EXIT_FAILED
 
 
@@ -436,19 +473,26 @@ def cmd_status(args) -> int:
         return EXIT_TRANSPORT
     if args.json:
         emit_json(info)
-        return EXIT_OK
-    for key in ("job_id", "state", "exit_code", "error_code", "pid",
-                "started_at", "finished_at", "last_activity", "stdout_bytes",
-                "stderr_bytes", "resource", "detail"):
-        value = info.get(key)
-        if value not in (None, "", 0):
-            sys.stdout.write("%-14s %s\n" % (key, value))
+    else:
+        for key in ("job_id", "state", "exit_code", "error_code", "pid",
+                    "started_at", "finished_at", "last_activity", "stdout_bytes",
+                    "stderr_bytes", "resource", "detail"):
+            value = info.get(key)
+            if value not in (None, "", 0):
+                sys.stdout.write("%-14s %s\n" % (key, value))
+    # A status query with an explicit budget that expired is the same "state
+    # unknown" case as `wl run --wait`: say 124 instead of a silent success.
+    if args.wait and args.wait > 0 and info.get("state") not in TERMINAL:
+        sys.stderr.write("wl: job %s is still %s after %gs; state is unknown\n"
+                         % (args.job_id, info.get("state"), float(args.wait)))
+        return EXIT_WAIT_TIMEOUT
     return EXIT_OK
 
 
 def cmd_logs(args) -> int:
     cursor = int(args.since or 0)
     chunk = 1 if args.follow else 0
+    data = {}
     while True:
         try:
             data = api("/job/logs",
@@ -458,6 +502,9 @@ def cmd_logs(args) -> int:
         except TransportError as exc:
             sys.stderr.write("wl: %s\n" % exc)
             return EXIT_TRANSPORT
+        if data.get("reset") and not args.json:
+            sys.stderr.write("[winbridge] log shrank below cursor %d (capture cap or "
+                             "restart); restarting from byte 0\n" % cursor)
         if args.json:
             emit_json(data)
         else:
@@ -484,7 +531,11 @@ def cmd_result(args) -> int:
         sys.stderr.write("wl: %s\n" % exc)
         return EXIT_TRANSPORT
     render_result(result, "json" if args.json else args.output)
-    return EXIT_OK
+    if result.get("state") not in TERMINAL:
+        sys.stderr.write("wl: job %s is not terminal; state is unknown / still running\n"
+                         % args.job_id)
+        return EXIT_WAIT_TIMEOUT
+    return exit_code_for(result)
 
 
 def cmd_cancel(args) -> int:

@@ -34,6 +34,21 @@ wl run --json "Get-Date"                    # 完整结构化结果
 ```
 
 `--exe ... -- args...` 是**首选**写法：路径含空格、单引号、中文、UNC 时不会出错。
+`--shell none` 后的多个参数也按 argv 传递，保留空参数、引号和 shell 元字符；
+单个完整命令行字符串仍兼容旧调用，由 Windows 原生解析，不经过 shell。
+`.cmd` / `.bat` 本身仍需命令解释器；任意数据应优先传给实际的 `.exe`，
+不要把设备命令拼进 `--shell cmd` 的脚本文本。
+
+`wl job result` 与 `wl run` 一样传播任务退出码；未结束返回 124，
+启动失败返回 126，取消返回 130。`wl batch` 桥接失败返回 125，
+等待未完成返回 124，已结束但存在失败步骤返回 1。
+`--wait` 包含提交请求与后续轮询的等待时间，耗尽预算不会取消 Windows 任务。
+
+`wl job status <id> --wait S` 同样遵守这条规则：预算耗尽仍在运行则打印
+`state is unknown` 并返回 124；不带 `--wait` 的查询是快照，运行中仍返回 0。
+`wl job logs` 返回的 `reset` 为 true 时表示游标越过了当前文件长度
+（采集上限截断或任务被重建），客户端的 `--since` 已回退到 0 并在 stderr
+提示，此时按从头读取处理，不要把它当成数据丢失的错误。
 
 ## 3. 长任务（本手册最重要的一节）
 
@@ -76,7 +91,14 @@ done
 ```
 
 - **不要**擅自改写工具输出的原文（比如 OmniCOM 的 hex 字段）。
-  桥接只做"截断/摘要/落盘"，原始字节永远完整保存在 `stdout.log`。
+  桥接只做"截断/摘要/落盘"，不会把厂商 JSON 中的 `ok:false` 自动转换成
+  进程失败；调用方仍需判断厂商的业务结果。
+- JSON 中 `stdout/stderr.omitted_bytes` 是摘要省略量；`capture_truncated=true`
+  表示磁盘采集触及 32 MB 上限，原始数据已有丢弃，下载文件也不能恢复。
+  `truncated` 在任一种截断发生时为 true。文本模式会向 stderr 告警，
+  不往 stdout 混入额外诊断；`--output summary` 同样包含两种截断标记。
+- 采集上限是原地截断，文件不会出现 NUL 填充，也不会短暂膨胀到上限的数倍：
+  并发读取方看到的始终是"至多 32 MB、全为真实输出"的内容。
 
 ## 5. 多步与串口互斥
 
@@ -150,6 +172,7 @@ wl http http://127.0.0.1:5000/api/items -X POST -d '{"name":"x"}' -H 'Content-Ty
 ~/WinLinuxBridge/tools/verify.sh          # 布局 + 链路
 ~/WinLinuxBridge/tools/verify_jobs.sh     # 超时语义/去重/游标/批处理
 ~/WinLinuxBridge/tools/verify_cancel.sh   # 取消隔离性
+python3 ~/WinLinuxBridge/tools/test_bridge_jobs.py -v  # 无隧道回归；Windows 上另测真实进程
 ```
 
 输出里 `[FAIL]` 为 0 才继续做正事。
